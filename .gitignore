@@ -1,0 +1,19 @@
+# Local environments
+.conda/
+.venv/
+venv/
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Local config
+.env
+
+# macOS
+.DS_Store
+
+# Build metadata
+*.egg-info/
