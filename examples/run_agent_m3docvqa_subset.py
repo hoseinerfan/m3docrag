@@ -133,6 +133,11 @@ def parse_args():
     p.add_argument("--output-jsonl", type=Path, required=True, help="Output JSONL with per-example traces.")
     p.add_argument("--summary-json", type=Path, default=None, help="Optional summary JSON path.")
     p.add_argument("--save-context-dir", type=Path, default=None, help="Optional directory to save per-doc context maps.")
+    p.add_argument(
+        "--clear-doc-cache-each-example",
+        action="store_true",
+        help="Clear cached embeddings/page contexts after each example to reduce memory growth on long runs.",
+    )
     p.add_argument("--stop-on-error", action="store_true")
     return p.parse_args()
 
@@ -521,6 +526,10 @@ class DocCache:
         self._emb_cache: dict[str, torch.Tensor] = {}
         self._ctx_cache: dict[str, dict[str, str]] = {}
 
+    def clear(self) -> None:
+        self._emb_cache.clear()
+        self._ctx_cache.clear()
+
     def get_doc_embeddings(self, doc_id: str) -> torch.Tensor:
         if doc_id in self._emb_cache:
             return self._emb_cache[doc_id]
@@ -640,6 +649,8 @@ def main():
         context_max_chars=args.context_max_chars,
         save_context_dir=args.save_context_dir,
     )
+    if args.clear_doc_cache_each_example:
+        logger.info("Enabled --clear-doc-cache-each-example (lower memory, slower runtime).")
 
     args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     summary_path = args.summary_json or (args.output_jsonl.parent / f"{args.output_jsonl.stem}_summary.json")
@@ -785,6 +796,8 @@ def main():
                 row["elapsed_sec"] = round(time.time() - started, 3)
                 fout.write(json.dumps(row) + "\n")
                 fout.flush()
+                if args.clear_doc_cache_each_example:
+                    cache.clear()
                 if args.device.startswith("cuda"):
                     torch.cuda.empty_cache()
 
