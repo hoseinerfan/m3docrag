@@ -77,7 +77,6 @@ _TV_SERIES_QUERY_HINTS = (
 )
 
 _TV_SERIES_CONTEXT_HINTS = (
-    " genre ",
     " sitcom",
     " showrunner",
     " created by ",
@@ -86,6 +85,20 @@ _TV_SERIES_CONTEXT_HINTS = (
     " production companies ",
     " narrated by ",
     " comedy series",
+    " television series",
+)
+
+_NON_TV_CONTEXT_HINTS = (
+    " song ",
+    " single ",
+    " album ",
+    " music video",
+    " discography",
+    " track listing",
+    " released ",
+    " recorded ",
+    " b-side",
+    " a-side",
 )
 
 
@@ -112,6 +125,8 @@ def _query_type_context_guard(query: str, context: str) -> bool:
     q = query.lower()
     c = f" {context.lower()} "
     if any(hint in q for hint in _TV_SERIES_QUERY_HINTS):
+        if any(hint in c for hint in _NON_TV_CONTEXT_HINTS):
+            return False
         return any(hint in c for hint in _TV_SERIES_CONTEXT_HINTS)
     return True
 
