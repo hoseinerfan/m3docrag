@@ -22,6 +22,7 @@ def run_agent_session(
     llm_call: Callable[[str], str],
     n_return_pages: int = 6,
     stop_if_seen: bool = True,
+    candidate_context_fn: Optional[Callable[[str, int], Optional[str]]] = None,
 ):
     """Iterative agent loop over the existing RAG model.
 
@@ -56,6 +57,17 @@ def run_agent_session(
             return {"answer": None, "reason": "no-new-candidates", "steps": memory.steps}
 
         top_for_turn = candidates[:pages_per_turn]
+        candidate_contexts = None
+        if candidate_context_fn is not None:
+            candidate_contexts = []
+            for doc_id, page_idx, _ in top_for_turn:
+                try:
+                    candidate_contexts.append(candidate_context_fn(doc_id, page_idx))
+                except Exception as exc:
+                    logger.warning(
+                        f"candidate_context_fn failed for doc={doc_id} page={page_idx}: {exc}"
+                    )
+                    candidate_contexts.append(None)
 
         # 2) decide action
         action = policy.select_action(
@@ -63,6 +75,7 @@ def run_agent_session(
             candidates=top_for_turn,
             memory=memory,
             llm_call=llm_call,
+            candidate_contexts=candidate_contexts,
         )
 
         if action["type"] == "answer":
@@ -78,4 +91,3 @@ def run_agent_session(
         current_query = action["text"] or current_query
 
     return {"answer": None, "reason": "max_turns", "steps": memory.steps}
-

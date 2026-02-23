@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from textwrap import dedent
-from typing import List, Sequence
+from typing import List, Optional, Sequence
 
 from loguru import logger
 
@@ -42,6 +42,7 @@ class AgentPolicy:
         candidates: Sequence[PageRef],
         memory: AgentMemory,
         llm_call,
+        candidate_contexts: Optional[Sequence[Optional[str]]] = None,
     ) -> dict:
         """Decide next action using the provided llm_call(query: str) -> str.
 
@@ -61,6 +62,10 @@ class AgentPolicy:
         prompt_parts.append("CANDIDATE PAGES:")
         for i, (doc_id, page_idx, score) in enumerate(candidates):
             prompt_parts.append(f"- [{i}] doc={doc_id} page={page_idx} score={score:.3f}")
+            if candidate_contexts and i < len(candidate_contexts):
+                context = candidate_contexts[i]
+                if context:
+                    prompt_parts.append(f"  summary: {context}")
 
         full_prompt = "\n".join(prompt_parts)
 
@@ -86,4 +91,3 @@ class AgentPolicy:
             action = {"type": "unanswerable", "text": reason, "chosen": list(candidates)}
 
         return action
-

@@ -16,6 +16,7 @@ import argparse
 import dataclasses
 import json
 from pathlib import Path
+from typing import Optional
 
 import torch
 
@@ -28,6 +29,81 @@ from m3docrag.utils.paths import LOCAL_MODEL_DIR
 def load_doc_embs(path: Path):
     obj = torch.load(path, map_location="cpu")
     return obj
+
+
+def _candidate_key_variants(doc_id: str, page_idx: int) -> list[str]:
+    return [
+        f"{doc_id}_page{page_idx}",
+        f"{doc_id}#p{page_idx}",
+        f"{doc_id}:{page_idx}",
+        f"{doc_id}/{page_idx}",
+    ]
+
+
+def _extract_context_text(obj) -> Optional[str]:
+    if obj is None:
+        return None
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, dict):
+        for key in ("summary", "text", "snippet", "page_summary", "content"):
+            value = obj.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def load_context_map(path: Path) -> dict[str, str]:
+    """Load page context snippets from JSON or JSONL.
+
+    Accepted formats:
+    - JSON object: {"<doc_id>_page<idx>": "...", ...}
+    - JSON list / JSONL rows with keys: doc_id, page_idx/page/page_id and summary/text/snippet
+    """
+
+    if not path.exists():
+        raise FileNotFoundError(f"Context file not found: {path}")
+
+    suffixes = {s.lower() for s in path.suffixes}
+    entries = []
+    if ".jsonl" in suffixes:
+        with path.open() as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                entries.append(json.loads(line))
+    else:
+        with path.open() as f:
+            loaded = json.load(f)
+        if isinstance(loaded, dict):
+            # Already keyed mapping, but values may be nested dicts.
+            out = {}
+            for key, value in loaded.items():
+                text = _extract_context_text(value)
+                if text:
+                    out[str(key)] = text
+            return out
+        if isinstance(loaded, list):
+            entries = loaded
+        else:
+            raise ValueError(f"Unsupported context JSON payload type: {type(loaded)}")
+
+    out: dict[str, str] = {}
+    for row in entries:
+        if not isinstance(row, dict):
+            continue
+        doc_id = row.get("doc_id") or row.get("document_id")
+        page_idx = row.get("page_idx", row.get("page", row.get("page_id")))
+        text = _extract_context_text(row)
+        if doc_id is None or page_idx is None or not text:
+            continue
+        try:
+            page_idx = int(page_idx)
+        except Exception:
+            continue
+        out[f"{doc_id}_page{page_idx}"] = text
+    return out
 
 
 def move_doc_embs(docid2embs, device: str):
@@ -210,6 +286,23 @@ def to_jsonable(obj):
     return obj
 
 
+def make_candidate_context_fn(
+    context_map: dict[str, str],
+    max_chars: int = 400,
+):
+    def _lookup(doc_id: str, page_idx: int) -> Optional[str]:
+        for key in _candidate_key_variants(doc_id, page_idx):
+            value = context_map.get(key)
+            if value:
+                value = " ".join(value.split())
+                if len(value) > max_chars:
+                    value = value[: max_chars - 3].rstrip() + "..."
+                return value
+        return None
+
+    return _lookup
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--question", required=True)
@@ -218,6 +311,18 @@ def parse_args():
     p.add_argument("--pages-per-turn", type=int, default=3)
     p.add_argument("--n-return-pages", type=int, default=6)
     p.add_argument("--device", default="cpu")
+    p.add_argument(
+        "--context-file",
+        type=Path,
+        default=None,
+        help="Optional JSON/JSONL file containing page summaries/snippets keyed by doc_id+page.",
+    )
+    p.add_argument(
+        "--context-max-chars",
+        type=int,
+        default=400,
+        help="Max characters per candidate summary/snippet inserted into the policy prompt.",
+    )
     p.add_argument(
         "--policy-backend",
         default="stub",
@@ -243,6 +348,13 @@ def main():
     docid2embs = move_doc_embs(load_doc_embs(args.embeddings), args.device)
 
     rag_model = build_rag_model(device=args.device)
+    candidate_context_fn = None
+    if args.context_file is not None:
+        context_map = load_context_map(args.context_file)
+        candidate_context_fn = make_candidate_context_fn(
+            context_map=context_map,
+            max_chars=args.context_max_chars,
+        )
 
     policy_device = args.policy_device or args.device
     if args.policy_backend == "stub":
@@ -264,6 +376,7 @@ def main():
         pages_per_turn=args.pages_per_turn,
         n_return_pages=args.n_return_pages,
         llm_call=llm_call,
+        candidate_context_fn=candidate_context_fn,
     )
 
     print(json.dumps(to_jsonable(result), indent=2))
