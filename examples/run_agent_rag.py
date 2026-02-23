@@ -64,21 +64,86 @@ def _normalize_policy_output(raw: str, prompt: str) -> str:
 def _resolve_policy_model_path(model_name_or_path: str) -> str:
     p = Path(model_name_or_path)
     if p.exists():
-        return str(p)
-    return str(Path(LOCAL_MODEL_DIR) / model_name_or_path)
+        resolved = p
+    else:
+        resolved = Path(LOCAL_MODEL_DIR) / model_name_or_path
+    if not resolved.exists():
+        raise FileNotFoundError(
+            f"Policy model path does not exist: {resolved}. "
+            "Pass a full local path or a folder name under LOCAL_MODEL_DIR."
+        )
+    return str(resolved)
 
 
 def make_llm_call_local_hf(model_name_or_path: str, device: str = "cuda"):
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
     resolved = _resolve_policy_model_path(model_name_or_path)
-    tokenizer = AutoTokenizer.from_pretrained(resolved, trust_remote_code=True)
+    config = AutoConfig.from_pretrained(resolved, trust_remote_code=True)
 
     if device.startswith("cuda"):
         dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
     else:
         dtype = torch.float32
 
+    system_prompt = (
+        "Return exactly one line in one of these formats only: "
+        "ANSWER: <text> OR CONTINUE QUERY: <text> OR UNANSWERABLE: <reason>."
+    )
+
+    if getattr(config, "model_type", "") == "qwen2_vl":
+        from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+
+        processor = AutoProcessor.from_pretrained(resolved, trust_remote_code=True)
+        model = Qwen2VLForConditionalGeneration.from_pretrained(
+            resolved,
+            torch_dtype=dtype,
+            trust_remote_code=True,
+            low_cpu_mem_usage=True,
+        ).eval()
+        if device != "cpu":
+            model = model.to(device)
+
+        def _call(prompt: str) -> str:
+            if hasattr(processor, "apply_chat_template"):
+                text = processor.apply_chat_template(
+                    [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": prompt},
+                    ],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+            else:
+                text = f"{system_prompt}\n\n{prompt}"
+
+            inputs = processor(
+                text=[text],
+                padding=True,
+                return_tensors="pt",
+            )
+            inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=64,
+                    do_sample=False,
+                )
+
+            generated_ids_trimmed = [
+                out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs["input_ids"], outputs)
+            ]
+            generated = processor.batch_decode(
+                generated_ids_trimmed,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0]
+            return _normalize_policy_output(generated, prompt)
+
+        return _call
+
+    tokenizer = AutoTokenizer.from_pretrained(resolved, trust_remote_code=True)
     model = AutoModelForCausalLM.from_pretrained(
         resolved,
         torch_dtype=dtype,
@@ -87,11 +152,6 @@ def make_llm_call_local_hf(model_name_or_path: str, device: str = "cuda"):
     ).eval()
     if device != "cpu":
         model = model.to(device)
-
-    system_prompt = (
-        "Return exactly one line in one of these formats only: "
-        "ANSWER: <text> OR CONTINUE QUERY: <text> OR UNANSWERABLE: <reason>."
-    )
 
     def _call(prompt: str) -> str:
         if hasattr(tokenizer, "apply_chat_template"):
