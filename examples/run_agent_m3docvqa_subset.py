@@ -109,6 +109,20 @@ def parse_args():
         default=None,
         help="Optional override for score column in retrieval parquet (used if rank column absent).",
     )
+    p.add_argument(
+        "--rank-gold-source",
+        default="mmqa-supporting-docs",
+        choices=["mmqa-supporting-docs", "qrels-parquet", "union"],
+        help="Gold doc source for rank diagnostics / 'selected gold doc' analysis.",
+    )
+    p.add_argument(
+        "--qrels-parquet",
+        type=Path,
+        default=None,
+        help="Optional qrels parquet for retrieval-rank gold docs (qid, doc_id).",
+    )
+    p.add_argument("--qrels-qid-col", default=None, help="Optional override for qid column in qrels parquet.")
+    p.add_argument("--qrels-doc-col", default=None, help="Optional override for doc_id column in qrels parquet.")
     p.add_argument("--max-turns", type=int, default=2)
     p.add_argument("--pages-per-turn", type=int, default=3)
     p.add_argument("--n-return-pages", type=int, default=5)
@@ -378,6 +392,62 @@ def load_retrieval_doc_pools_from_parquet(
     return out
 
 
+def load_qrels_doc_map_from_parquet(
+    *,
+    parquet_path: Path,
+    qids: list[str],
+    qid_col: Optional[str],
+    doc_col: Optional[str],
+) -> dict[str, list[str]]:
+    """Load gold doc ids per qid from qrels parquet."""
+    if not parquet_path.exists():
+        raise FileNotFoundError(parquet_path)
+
+    qid_set = {str(q) for q in qids}
+
+    try:
+        import pyarrow.dataset as ds
+    except Exception as exc:
+        raise RuntimeError("pyarrow is required to load qrels parquet for rank diagnostics") from exc
+
+    dataset = ds.dataset(str(parquet_path), format="parquet")
+    col_names = list(dataset.schema.names)
+    qid_col = _pick_column(col_names, qid_col, ["qid", "query_id", "question_id"], "qrels qid")
+    doc_col = _pick_column(
+        col_names,
+        doc_col,
+        ["doc_id", "document_id", "candidate_doc_id", "target_doc_id"],
+        "qrels doc_id",
+    )
+
+    try:
+        table = dataset.to_table(columns=[qid_col, doc_col], filter=ds.field(qid_col).isin(list(qid_set)))
+    except Exception:
+        table = dataset.to_table(columns=[qid_col, doc_col])
+
+    grouped: dict[str, list[str]] = {q: [] for q in qids}
+    seen_per_qid: dict[str, set[str]] = {q: set() for q in qids}
+    for row in table.to_pylist():
+        qid = row.get(qid_col)
+        doc_id = row.get(doc_col)
+        if qid is None or doc_id is None:
+            continue
+        qid = str(qid)
+        if qid not in qid_set:
+            continue
+        doc_id = str(doc_id)
+        if doc_id in seen_per_qid.setdefault(qid, set()):
+            continue
+        seen_per_qid[qid].add(doc_id)
+        grouped.setdefault(qid, []).append(doc_id)
+
+    logger.info(
+        f"Loaded qrels gold docs from {parquet_path} for {len(grouped)} qids "
+        f"(avg gold docs/qid={sum(len(v) for v in grouped.values()) / max(len(grouped), 1):.2f})"
+    )
+    return grouped
+
+
 def compute_gold_doc_rank_info(gold_doc_ids: list[str], doc_pool_ids: list[str]) -> dict:
     pos = {doc_id: i + 1 for i, doc_id in enumerate(doc_pool_ids)}
     gold_ranks = {doc_id: pos[doc_id] for doc_id in gold_doc_ids if doc_id in pos}
@@ -527,11 +597,12 @@ def main():
 
     logger.info(f"Selected {len(examples)} examples from {mmqa_jsonl}")
 
+    selected_qids = [str(ex.get("qid", f"idx_{i}")) for i, ex in enumerate(examples)]
+
     retrieval_doc_pools = None
     if args.doc_pool_source == "retrieval-parquet":
         if args.retrieval_edges_parquet is None:
             raise ValueError("--retrieval-edges-parquet is required when --doc-pool-source retrieval-parquet")
-        selected_qids = [str(ex.get("qid", f"idx_{i}")) for i, ex in enumerate(examples)]
         retrieval_doc_pools = load_retrieval_doc_pools_from_parquet(
             parquet_path=args.retrieval_edges_parquet,
             qids=selected_qids,
@@ -540,6 +611,16 @@ def main():
             doc_col=args.retrieval_doc_col,
             rank_col=args.retrieval_rank_col,
             score_col=args.retrieval_score_col,
+        )
+    qrels_doc_map = None
+    if args.rank_gold_source in {"qrels-parquet", "union"}:
+        if args.qrels_parquet is None:
+            raise ValueError("--qrels-parquet is required when --rank-gold-source is qrels-parquet or union")
+        qrels_doc_map = load_qrels_doc_map_from_parquet(
+            parquet_path=args.qrels_parquet,
+            qids=selected_qids,
+            qid_col=args.qrels_qid_col,
+            doc_col=args.qrels_doc_col,
         )
 
     rag_model = build_rag_model(device=args.device)
@@ -580,6 +661,20 @@ def main():
             question = str(example.get("question", "")).strip()
             gold_answers = extract_gold_answers(example)
             supporting_doc_ids = extract_supporting_doc_ids(example)
+            qrels_gold_doc_ids = list((qrels_doc_map or {}).get(qid, []))
+
+            if args.rank_gold_source == "mmqa-supporting-docs":
+                rank_gold_doc_ids = list(supporting_doc_ids)
+            elif args.rank_gold_source == "qrels-parquet":
+                rank_gold_doc_ids = qrels_gold_doc_ids
+            else:
+                rank_gold_doc_ids = []
+                seen_rank_gold = set()
+                for doc_id in supporting_doc_ids + qrels_gold_doc_ids:
+                    if doc_id in seen_rank_gold:
+                        continue
+                    seen_rank_gold.add(doc_id)
+                    rank_gold_doc_ids.append(doc_id)
 
             if args.doc_pool_source == "supporting-docs":
                 doc_pool_entries = [{"doc_id": d, "rank": j + 1, "score": None, "source_rank": None} for j, d in enumerate(supporting_doc_ids)]
@@ -587,7 +682,7 @@ def main():
                 assert retrieval_doc_pools is not None
                 doc_pool_entries = retrieval_doc_pools.get(qid, [])
             doc_pool_ids = [str(x["doc_id"]) for x in doc_pool_entries]
-            gold_rank_info = compute_gold_doc_rank_info(supporting_doc_ids, doc_pool_ids)
+            gold_rank_info = compute_gold_doc_rank_info(rank_gold_doc_ids, doc_pool_ids)
             best_gold_rank = gold_rank_info["best_gold_doc_rank_in_doc_pool"]
             if best_gold_rank is not None:
                 retrieval_diag_counts["examples_with_any_gold_in_doc_pool"] += 1
@@ -604,6 +699,9 @@ def main():
                 "question": question,
                 "gold_answers": gold_answers,
                 "supporting_doc_ids": supporting_doc_ids,
+                "rank_gold_source": args.rank_gold_source,
+                "rank_gold_doc_ids": rank_gold_doc_ids,
+                "qrels_gold_doc_ids": (qrels_gold_doc_ids if qrels_doc_map is not None else None),
                 "doc_pool_source": args.doc_pool_source,
                 "doc_pool_doc_ids": doc_pool_ids,
                 "doc_pool_size": len(doc_pool_ids),
@@ -648,7 +746,7 @@ def main():
                 reason = payload.get("reason")
                 counts[reason] = counts.get(reason, 0) + 1
                 pred_answer = payload.get("answer")
-                agent_rank_info = compute_agent_selection_rank_info(payload, supporting_doc_ids, doc_pool_ids)
+                agent_rank_info = compute_agent_selection_rank_info(payload, rank_gold_doc_ids, doc_pool_ids)
                 if agent_rank_info["selected_any_gold_doc"]:
                     retrieval_diag_counts["examples_with_agent_selected_gold_doc"] += 1
                 if agent_rank_info["first_turn_with_gold_doc_selected"] == 1:
@@ -709,8 +807,10 @@ def main():
             "context_max_chars": args.context_max_chars,
             "max_pages_per_doc": args.max_pages_per_doc,
             "doc_pool": args.doc_pool_source,
+            "rank_gold_source": args.rank_gold_source,
             "retrieval_edges_parquet": (str(args.retrieval_edges_parquet) if args.retrieval_edges_parquet else None),
             "retrieval_topk_docs": args.retrieval_topk_docs if args.doc_pool_source == "retrieval-parquet" else None,
+            "qrels_parquet": (str(args.qrels_parquet) if args.qrels_parquet else None),
         },
         "retrieval_diagnostics": {
             **retrieval_diag_counts,
