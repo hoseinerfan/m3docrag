@@ -46,6 +46,90 @@ def make_llm_call_stub():
     return _call
 
 
+def _normalize_policy_output(raw: str, prompt: str) -> str:
+    if raw is None:
+        raw = ""
+    line = raw.strip().splitlines()[0].strip() if raw.strip() else ""
+    lower = line.lower()
+    if (
+        lower.startswith("answer:")
+        or lower.startswith("continue query:")
+        or lower.startswith("unanswerable")
+    ):
+        return line
+    question = prompt.split("QUESTION:")[-1].strip().split("\n")[0]
+    return f"CONTINUE QUERY: {question}"
+
+
+def _resolve_policy_model_path(model_name_or_path: str) -> str:
+    p = Path(model_name_or_path)
+    if p.exists():
+        return str(p)
+    return str(Path(LOCAL_MODEL_DIR) / model_name_or_path)
+
+
+def make_llm_call_local_hf(model_name_or_path: str, device: str = "cuda"):
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    resolved = _resolve_policy_model_path(model_name_or_path)
+    tokenizer = AutoTokenizer.from_pretrained(resolved, trust_remote_code=True)
+
+    if device.startswith("cuda"):
+        dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else torch.float16
+    else:
+        dtype = torch.float32
+
+    model = AutoModelForCausalLM.from_pretrained(
+        resolved,
+        torch_dtype=dtype,
+        trust_remote_code=True,
+        low_cpu_mem_usage=True,
+    ).eval()
+    if device != "cpu":
+        model = model.to(device)
+
+    system_prompt = (
+        "Return exactly one line in one of these formats only: "
+        "ANSWER: <text> OR CONTINUE QUERY: <text> OR UNANSWERABLE: <reason>."
+    )
+
+    def _call(prompt: str) -> str:
+        if hasattr(tokenizer, "apply_chat_template"):
+            text = tokenizer.apply_chat_template(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        else:
+            text = f"{system_prompt}\n\n{prompt}"
+
+        inputs = tokenizer(
+            text,
+            return_tensors="pt",
+            truncation=True,
+            max_length=4096,
+        )
+        inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=64,
+                do_sample=False,
+            )
+
+        generated = tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[1] :],
+            skip_special_tokens=True,
+        )
+        return _normalize_policy_output(generated, prompt)
+
+    return _call
+
+
 def build_rag_model(device: str = "cpu"):
     retrieval_model = ColPaliRetrievalModel(
         backbone_name_or_path=f"{LOCAL_MODEL_DIR}/colpaligemma-3b-pt-448-base",
@@ -74,6 +158,22 @@ def parse_args():
     p.add_argument("--pages-per-turn", type=int, default=3)
     p.add_argument("--n-return-pages", type=int, default=6)
     p.add_argument("--device", default="cpu")
+    p.add_argument(
+        "--policy-backend",
+        default="stub",
+        choices=["stub", "local-hf"],
+        help="Policy backend for agent decisions.",
+    )
+    p.add_argument(
+        "--policy-model",
+        default=None,
+        help="Local HF model path or model folder name under LOCAL_MODEL_DIR (used when --policy-backend local-hf).",
+    )
+    p.add_argument(
+        "--policy-device",
+        default=None,
+        help="Device for policy model (defaults to --device). Use cpu if GPU memory is tight.",
+    )
     return p.parse_args()
 
 
@@ -84,6 +184,16 @@ def main():
 
     rag_model = build_rag_model(device=args.device)
 
+    policy_device = args.policy_device or args.device
+    if args.policy_backend == "stub":
+        llm_call = make_llm_call_stub()
+    elif args.policy_backend == "local-hf":
+        if not args.policy_model:
+            raise ValueError("--policy-model is required when --policy-backend local-hf")
+        llm_call = make_llm_call_local_hf(args.policy_model, device=policy_device)
+    else:
+        raise ValueError(f"Unknown policy backend: {args.policy_backend}")
+
     result = run_agent_session(
         query=args.question,
         rag_model=rag_model,
@@ -93,7 +203,7 @@ def main():
         max_turns=args.max_turns,
         pages_per_turn=args.pages_per_turn,
         n_return_pages=args.n_return_pages,
-        llm_call=make_llm_call_stub(),
+        llm_call=llm_call,
     )
 
     print(json.dumps(to_jsonable(result), indent=2))
