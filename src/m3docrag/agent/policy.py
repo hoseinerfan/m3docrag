@@ -44,7 +44,6 @@ _TITLE_QUERY_HINTS = (
 )
 
 _TITLE_CUTOFF_MARKERS = (
-    " 31 languages",
     " ArticleTalk",
     " Read Edit",
     " View history",
@@ -53,9 +52,68 @@ _TITLE_CUTOFF_MARKERS = (
     " Directed by ",
 )
 
+_REJECT_TITLE_PREFIXES = (
+    "this page was last edited",
+    "privacy policy",
+    "notes [edit]",
+    "references [edit]",
+    "internet portal",
+    "music portal",
+    "production executive producers",
+    "outstanding writing for",
+    "brown served as",
+    "in november",
+)
+
+_REJECT_TITLE_SUBSTRINGS = (
+    "cookie statement",
+    "about wikipedia",
+    "disclaimerscontact wikipedia",
+)
+
+_TV_SERIES_QUERY_HINTS = (
+    "tv series",
+    "television series",
+)
+
+_TV_SERIES_CONTEXT_HINTS = (
+    " genre ",
+    " sitcom",
+    " showrunner",
+    " created by ",
+    " starring ",
+    " running time ",
+    " production companies ",
+    " narrated by ",
+    " comedy series",
+)
+
 
 def _normalize_ws(text: str) -> str:
     return " ".join(text.split())
+
+
+def _strip_wikipedia_suffixes(text: str) -> str:
+    # Remove "<N> languages" and any trailing UI tokens if they remain.
+    text = re.sub(r"\s+\d+\s+languages?\b.*$", "", text, flags=re.IGNORECASE)
+    return text.strip()
+
+
+def _looks_like_boilerplate(title: str) -> bool:
+    lower = title.lower()
+    if any(lower.startswith(prefix) for prefix in _REJECT_TITLE_PREFIXES):
+        return True
+    if any(token in lower for token in _REJECT_TITLE_SUBSTRINGS):
+        return True
+    return False
+
+
+def _query_type_context_guard(query: str, context: str) -> bool:
+    q = query.lower()
+    c = f" {context.lower()} "
+    if any(hint in q for hint in _TV_SERIES_QUERY_HINTS):
+        return any(hint in c for hint in _TV_SERIES_CONTEXT_HINTS)
+    return True
 
 
 def _extract_title_from_summary(summary: str) -> Optional[str]:
@@ -64,6 +122,9 @@ def _extract_title_from_summary(summary: str) -> Optional[str]:
         return None
 
     cut = len(text)
+    lang_match = re.search(r"\b\d+\s+languages?\b", text, flags=re.IGNORECASE)
+    if lang_match and lang_match.start() > 0:
+        cut = min(cut, lang_match.start())
     for marker in _TITLE_CUTOFF_MARKERS:
         idx = text.find(marker)
         if idx > 0:
@@ -77,9 +138,12 @@ def _extract_title_from_summary(summary: str) -> Optional[str]:
     if cut == len(text):
         candidate = " ".join(candidate.split()[:6]).strip(" -:|.,;")
 
+    candidate = _strip_wikipedia_suffixes(candidate)
     if len(candidate) < 2 or len(candidate) > 80:
         return None
     if not re.search(r"[A-Za-z]", candidate):
+        return None
+    if _looks_like_boilerplate(candidate):
         return None
 
     return candidate
@@ -98,7 +162,15 @@ def _maybe_direct_answer_from_context(
         return None
 
     for i, context in enumerate(candidate_contexts):
+        if i >= len(candidates):
+            break
+        _, page_idx, _ = candidates[i]
+        # Only auto-answer from the document's first page; other pages are too noisy.
+        if page_idx != 0:
+            continue
         if not context:
+            continue
+        if not _query_type_context_guard(query, context):
             continue
         title = _extract_title_from_summary(context)
         if not title:
