@@ -17,6 +17,7 @@ import dataclasses
 import json
 from pathlib import Path
 from typing import Optional
+import warnings
 
 import torch
 
@@ -113,6 +114,28 @@ def move_doc_embs(docid2embs, device: str):
     return {doc_id: embs.to(device) for doc_id, embs in docid2embs.items()}
 
 
+def configure_warning_filters():
+    # Suppress known noisy warnings from transformers/model wrappers during smoke runs.
+    patterns = [
+        r"`config\.hidden_act` is ignored",
+        r"Gemma's activation function will be set to `gelu_pytorch_tanh`",
+        r"You are passing both `text` and `images` to `PaliGemmaProcessor`",
+        r"`Qwen2VLRotaryEmbedding` can now be fully parameterized",
+    ]
+    for pattern in patterns:
+        warnings.filterwarnings("ignore", message=pattern)
+
+
+def _sanitize_generation_config(model):
+    cfg = getattr(model, "generation_config", None)
+    if cfg is None:
+        return
+    # Qwen checkpoints may ship sampling params that trigger warnings in greedy mode.
+    for attr in ("temperature", "top_p", "top_k"):
+        if hasattr(cfg, attr):
+            setattr(cfg, attr, None)
+
+
 def make_llm_call_stub():
     def _call(prompt: str) -> str:
         # TODO: replace with real LLM call; for now echo a continue.
@@ -174,9 +197,9 @@ def make_llm_call_local_hf(model_name_or_path: str, device: str = "cuda"):
         model = Qwen2VLForConditionalGeneration.from_pretrained(
             resolved,
             torch_dtype=dtype,
-            trust_remote_code=True,
             low_cpu_mem_usage=True,
         ).eval()
+        _sanitize_generation_config(model)
         if device != "cpu":
             model = model.to(device)
 
@@ -226,6 +249,7 @@ def make_llm_call_local_hf(model_name_or_path: str, device: str = "cuda"):
         trust_remote_code=True,
         low_cpu_mem_usage=True,
     ).eval()
+    _sanitize_generation_config(model)
     if device != "cpu":
         model = model.to(device)
 
@@ -339,11 +363,18 @@ def parse_args():
         default=None,
         help="Device for policy model (defaults to --device). Use cpu if GPU memory is tight.",
     )
+    p.add_argument(
+        "--output-json",
+        type=Path,
+        default=None,
+        help="Optional path to save the agent result JSON (also prints to stdout).",
+    )
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    configure_warning_filters()
 
     docid2embs = move_doc_embs(load_doc_embs(args.embeddings), args.device)
 
@@ -379,7 +410,12 @@ def main():
         candidate_context_fn=candidate_context_fn,
     )
 
-    print(json.dumps(to_jsonable(result), indent=2))
+    payload = to_jsonable(result)
+    rendered = json.dumps(payload, indent=2)
+    if args.output_json is not None:
+        args.output_json.parent.mkdir(parents=True, exist_ok=True)
+        args.output_json.write_text(rendered + "\n")
+    print(rendered)
 
 
 if __name__ == "__main__":
