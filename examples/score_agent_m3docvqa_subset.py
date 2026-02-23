@@ -118,6 +118,12 @@ def _update_bucket(bucket: dict, *, reason: str, pred_answered: bool, exact: Opt
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--results-jsonl", type=Path, required=True, help="Output JSONL from run_agent_m3docvqa_subset.py")
+    p.add_argument(
+        "--low-rank-threshold",
+        type=int,
+        default=50,
+        help="Threshold for 'low-ranked gold doc' rescue analysis (based on best_gold_doc_rank_in_doc_pool).",
+    )
     p.add_argument("--show-errors-only", action="store_true", help="Print only wrong answered / missed-answer examples.")
     p.add_argument("--show-details", action="store_true", help="Print per-example rows.")
     p.add_argument("--max-detail-rows", type=int, default=50)
@@ -145,6 +151,13 @@ def main():
     examples_with_gold = 0
     missed_with_gold = 0
     by_qtype: dict[str, dict] = {}
+    best_gold_ranks = []
+    gold_in_pool_count = 0
+    selected_any_gold_doc_count = 0
+    selected_gold_doc_turn1_count = 0
+    selected_gold_doc_late_count = 0
+    low_rank_with_gold_count = 0
+    low_rank_rescued_count = 0
 
     details = []
 
@@ -159,6 +172,9 @@ def main():
         pred = row.get("pred_answer")
         question = row.get("question")
         qtype = _classify_question_type(question)
+        best_gold_rank = row.get("best_gold_doc_rank_in_doc_pool")
+        selected_any_gold_doc = bool(row.get("selected_any_gold_doc", False))
+        first_turn_with_gold_doc_selected = row.get("first_turn_with_gold_doc_selected")
         gold_answers = row.get("gold_answers") or []
         if not isinstance(gold_answers, list):
             gold_answers = [str(gold_answers)]
@@ -206,6 +222,24 @@ def main():
         bucket = by_qtype.setdefault(qtype, _init_bucket())
         _update_bucket(bucket, reason=reason, pred_answered=pred_answered, exact=exact, exact_ocr=exact_ocr)
 
+        if best_gold_rank is not None:
+            try:
+                best_gold_rank = int(best_gold_rank)
+                gold_in_pool_count += 1
+                best_gold_ranks.append(best_gold_rank)
+                if best_gold_rank > args.low_rank_threshold:
+                    low_rank_with_gold_count += 1
+                    if selected_any_gold_doc:
+                        low_rank_rescued_count += 1
+            except Exception:
+                pass
+        if selected_any_gold_doc:
+            selected_any_gold_doc_count += 1
+            if first_turn_with_gold_doc_selected == 1:
+                selected_gold_doc_turn1_count += 1
+            elif first_turn_with_gold_doc_selected is not None:
+                selected_gold_doc_late_count += 1
+
         details.append(
             {
                 "qid": row.get("qid"),
@@ -213,6 +247,9 @@ def main():
                 "question": question,
                 "reason": reason,
                 "status": status,
+                "best_gold_doc_rank_in_doc_pool": best_gold_rank,
+                "selected_any_gold_doc": selected_any_gold_doc,
+                "first_turn_with_gold_doc_selected": first_turn_with_gold_doc_selected,
                 "pred_answer": pred,
                 "gold_answers": gold_answers,
                 "pred_answer_exact_in_gold": exact,
@@ -241,6 +278,22 @@ def main():
             exact_match_ocr_relaxed_answered / answered_count
         ) if answered_count else None,
         "answer_coverage_rate": (answered_count / total) if total else None,
+        "gold_in_doc_pool_count": gold_in_pool_count,
+        "gold_in_doc_pool_rate": (gold_in_pool_count / total) if total else None,
+        "avg_best_gold_doc_rank_in_doc_pool": (sum(best_gold_ranks) / len(best_gold_ranks)) if best_gold_ranks else None,
+        "mrr_best_gold_doc_in_doc_pool": (
+            sum(1.0 / r for r in best_gold_ranks) / len(best_gold_ranks) if best_gold_ranks else None
+        ),
+        "selected_any_gold_doc_count": selected_any_gold_doc_count,
+        "selected_any_gold_doc_rate": (selected_any_gold_doc_count / total) if total else None,
+        "selected_gold_doc_turn1_count": selected_gold_doc_turn1_count,
+        "selected_gold_doc_late_count": selected_gold_doc_late_count,
+        "low_rank_threshold": args.low_rank_threshold,
+        "low_rank_with_gold_count": low_rank_with_gold_count,
+        "low_rank_rescued_count": low_rank_rescued_count,
+        "low_rank_rescue_rate": (
+            low_rank_rescued_count / low_rank_with_gold_count if low_rank_with_gold_count else None
+        ),
     }
 
     print("Metrics")
@@ -261,6 +314,18 @@ def main():
     print(f"- exact_match_ocr_relaxed_overall_rate: {metrics['exact_match_ocr_relaxed_overall_rate']}")
     print(f"- exact_match_ocr_relaxed_on_answered_rate: {metrics['exact_match_ocr_relaxed_on_answered_rate']}")
     print(f"- answer_coverage_rate: {metrics['answer_coverage_rate']}")
+    print(f"- gold_in_doc_pool_count: {metrics['gold_in_doc_pool_count']}")
+    print(f"- gold_in_doc_pool_rate: {metrics['gold_in_doc_pool_rate']}")
+    print(f"- avg_best_gold_doc_rank_in_doc_pool: {metrics['avg_best_gold_doc_rank_in_doc_pool']}")
+    print(f"- mrr_best_gold_doc_in_doc_pool: {metrics['mrr_best_gold_doc_in_doc_pool']}")
+    print(f"- selected_any_gold_doc_count: {metrics['selected_any_gold_doc_count']}")
+    print(f"- selected_any_gold_doc_rate: {metrics['selected_any_gold_doc_rate']}")
+    print(f"- selected_gold_doc_turn1_count: {metrics['selected_gold_doc_turn1_count']}")
+    print(f"- selected_gold_doc_late_count: {metrics['selected_gold_doc_late_count']}")
+    print(f"- low_rank_threshold: {metrics['low_rank_threshold']}")
+    print(f"- low_rank_with_gold_count: {metrics['low_rank_with_gold_count']}")
+    print(f"- low_rank_rescued_count: {metrics['low_rank_rescued_count']}")
+    print(f"- low_rank_rescue_rate: {metrics['low_rank_rescue_rate']}")
 
     print("\nQuestion-Type Breakdown")
     for qtype in sorted(by_qtype.keys()):
@@ -281,6 +346,7 @@ def main():
                 continue
             print(
                 f"- {d['qid']} | {d['question_type']} | {d['status']} | reason={d['reason']} | "
+                f"gold_rank={d['best_gold_doc_rank_in_doc_pool']} | selected_gold={d['selected_any_gold_doc']} | "
                 f"pred={d['pred_answer']!r} | gold={d['gold_answers'][:2]}"
             )
             shown += 1

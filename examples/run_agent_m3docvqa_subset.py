@@ -11,7 +11,7 @@ import argparse
 import json
 import time
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Optional
 
 import torch
 from loguru import logger
@@ -79,6 +79,36 @@ def parse_args():
     )
     p.add_argument("--context-backend", choices=["pypdf", "pymupdf", "easyocr", "auto"], default="pypdf")
     p.add_argument("--context-max-chars", type=int, default=400)
+    p.add_argument(
+        "--doc-pool-source",
+        default="supporting-docs",
+        choices=["supporting-docs", "retrieval-parquet"],
+        help="Document pool per example: oracle supporting docs or top retrieved docs from parquet.",
+    )
+    p.add_argument(
+        "--retrieval-edges-parquet",
+        type=Path,
+        default=None,
+        help="Parquet file with per-qid retrieved docs (required when --doc-pool-source retrieval-parquet).",
+    )
+    p.add_argument(
+        "--retrieval-topk-docs",
+        type=int,
+        default=1000,
+        help="Max docs to load from retrieval parquet per qid.",
+    )
+    p.add_argument("--retrieval-qid-col", default=None, help="Optional override for qid column in retrieval parquet.")
+    p.add_argument("--retrieval-doc-col", default=None, help="Optional override for doc_id column in retrieval parquet.")
+    p.add_argument(
+        "--retrieval-rank-col",
+        default=None,
+        help="Optional override for rank column in retrieval parquet (ascending rank).",
+    )
+    p.add_argument(
+        "--retrieval-score-col",
+        default=None,
+        help="Optional override for score column in retrieval parquet (used if rank column absent).",
+    )
     p.add_argument("--max-turns", type=int, default=2)
     p.add_argument("--pages-per-turn", type=int, default=3)
     p.add_argument("--n-return-pages", type=int, default=5)
@@ -186,6 +216,221 @@ def _norm_answer(text: Optional[str]) -> Optional[str]:
     return text or None
 
 
+def _pick_column(
+    names: list[str],
+    explicit: Optional[str],
+    candidates: list[str],
+    label: str,
+    required: bool = True,
+) -> Optional[str]:
+    if explicit is not None:
+        if explicit not in names:
+            raise ValueError(f"{label} column {explicit!r} not found in parquet columns: {names}")
+        return explicit
+    lower_map = {n.lower(): n for n in names}
+    for cand in candidates:
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
+    if required:
+        raise ValueError(f"Could not auto-detect {label} column. Available columns: {names}")
+    return None
+
+
+def load_retrieval_doc_pools_from_parquet(
+    *,
+    parquet_path: Path,
+    qids: list[str],
+    topk_docs: int,
+    qid_col: Optional[str],
+    doc_col: Optional[str],
+    rank_col: Optional[str],
+    score_col: Optional[str],
+) -> dict[str, list[dict]]:
+    """Load top retrieved docs per qid from a parquet file.
+
+    Returns:
+        {qid: [{"doc_id": str, "rank": int, "score": float|None, "source_rank": Any}, ...]}
+    """
+    if not parquet_path.exists():
+        raise FileNotFoundError(parquet_path)
+
+    qid_set = {str(q) for q in qids}
+
+    try:
+        import pyarrow.dataset as ds
+    except Exception as exc:
+        raise RuntimeError(
+            "pyarrow is required to load retrieval parquet for --doc-pool-source retrieval-parquet"
+        ) from exc
+
+    dataset = ds.dataset(str(parquet_path), format="parquet")
+    col_names = list(dataset.schema.names)
+    qid_col = _pick_column(col_names, qid_col, ["qid", "query_id", "question_id"], "qid")
+    doc_col = _pick_column(
+        col_names,
+        doc_col,
+        [
+            "doc_id",
+            "document_id",
+            "candidate_doc_id",
+            "dst_doc_id",
+            "target_doc_id",
+            "node_id_dst",
+        ],
+        "doc_id",
+    )
+    rank_col = _pick_column(
+        col_names,
+        rank_col,
+        ["rank", "retrieval_rank", "position", "pos", "idx"],
+        "rank",
+        required=False,
+    )
+    score_col = _pick_column(
+        col_names,
+        score_col,
+        ["score", "retrieval_score", "sim", "similarity", "weight"],
+        "score",
+        required=False,
+    )
+
+    cols = [qid_col, doc_col]
+    if rank_col:
+        cols.append(rank_col)
+    if score_col and score_col not in cols:
+        cols.append(score_col)
+
+    try:
+        table = dataset.to_table(columns=cols, filter=ds.field(qid_col).isin(list(qid_set)))
+    except Exception:
+        # Fallback if parquet/qid dtype mismatch prevents pushdown filtering.
+        table = dataset.to_table(columns=cols)
+
+    rows = []
+    for row in table.to_pylist():
+        qid = row.get(qid_col)
+        doc_id = row.get(doc_col)
+        if qid is None or doc_id is None:
+            continue
+        qid = str(qid)
+        if qid not in qid_set:
+            continue
+        rows.append(
+            {
+                "qid": qid,
+                "doc_id": str(doc_id),
+                "source_rank": row.get(rank_col) if rank_col else None,
+                "score": row.get(score_col) if score_col else None,
+            }
+        )
+
+    grouped: dict[str, list[dict]] = {q: [] for q in qids}
+    for row in rows:
+        grouped.setdefault(row["qid"], []).append(row)
+
+    out: dict[str, list[dict]] = {}
+    for qid in qids:
+        items = grouped.get(qid, [])
+        if rank_col:
+            def _rank_key(x):
+                r = x.get("source_rank")
+                try:
+                    return (0, int(r))
+                except Exception:
+                    return (1, float("inf"))
+            items = sorted(items, key=_rank_key)
+        elif score_col:
+            def _score_key(x):
+                s = x.get("score")
+                try:
+                    return float(s)
+                except Exception:
+                    return float("-inf")
+            items = sorted(items, key=_score_key, reverse=True)
+
+        dedup = []
+        seen_docs = set()
+        for row in items:
+            doc_id = row["doc_id"]
+            if doc_id in seen_docs:
+                continue
+            seen_docs.add(doc_id)
+            dedup.append(row)
+            if topk_docs is not None and len(dedup) >= topk_docs:
+                break
+
+        normalized = []
+        for i, row in enumerate(dedup, start=1):
+            normalized.append(
+                {
+                    "doc_id": row["doc_id"],
+                    "rank": i,
+                    "score": (float(row["score"]) if row.get("score") is not None else None),
+                    "source_rank": row.get("source_rank"),
+                }
+            )
+        out[qid] = normalized
+
+    logger.info(
+        f"Loaded retrieval doc pools from {parquet_path} for {len(out)} qids "
+        f"(avg docs/qid={sum(len(v) for v in out.values()) / max(len(out), 1):.1f})"
+    )
+    return out
+
+
+def compute_gold_doc_rank_info(gold_doc_ids: list[str], doc_pool_ids: list[str]) -> dict:
+    pos = {doc_id: i + 1 for i, doc_id in enumerate(doc_pool_ids)}
+    gold_ranks = {doc_id: pos[doc_id] for doc_id in gold_doc_ids if doc_id in pos}
+    best = min(gold_ranks.values()) if gold_ranks else None
+    return {
+        "gold_doc_ranks_in_doc_pool": gold_ranks,
+        "num_gold_docs_in_doc_pool": len(gold_ranks),
+        "best_gold_doc_rank_in_doc_pool": best,
+    }
+
+
+def compute_agent_selection_rank_info(agent_payload: dict, gold_doc_ids: list[str], doc_pool_ids: list[str]) -> dict:
+    pos = {doc_id: i + 1 for i, doc_id in enumerate(doc_pool_ids)}
+    gold_set = set(gold_doc_ids)
+    turns = []
+    first_turn_with_gold = None
+    all_selected_gold = []
+
+    for step in agent_payload.get("steps", []) or []:
+        seen = set()
+        selected_doc_ids = []
+        for item in step.get("selected_pages", []) or []:
+            if not isinstance(item, list) or len(item) < 1:
+                continue
+            doc_id = str(item[0])
+            if doc_id in seen:
+                continue
+            seen.add(doc_id)
+            selected_doc_ids.append(doc_id)
+
+        selected_gold = [d for d in selected_doc_ids if d in gold_set]
+        if selected_gold and first_turn_with_gold is None:
+            first_turn_with_gold = step.get("turn")
+        all_selected_gold.extend([d for d in selected_gold if d not in all_selected_gold])
+
+        turns.append(
+            {
+                "turn": step.get("turn"),
+                "selected_doc_ids": selected_doc_ids,
+                "selected_doc_ranks_in_doc_pool": {d: pos.get(d) for d in selected_doc_ids},
+                "selected_gold_docs": selected_gold,
+                "selected_gold_doc_ranks_in_doc_pool": {d: pos.get(d) for d in selected_gold},
+            }
+        )
+
+    return {
+        "first_turn_with_gold_doc_selected": first_turn_with_gold,
+        "selected_any_gold_doc": first_turn_with_gold is not None,
+        "selected_gold_docs_any_turn": all_selected_gold,
+        "per_turn_doc_selection": turns,
+    }
+
+
 class DocCache:
     def __init__(
         self,
@@ -282,6 +527,21 @@ def main():
 
     logger.info(f"Selected {len(examples)} examples from {mmqa_jsonl}")
 
+    retrieval_doc_pools = None
+    if args.doc_pool_source == "retrieval-parquet":
+        if args.retrieval_edges_parquet is None:
+            raise ValueError("--retrieval-edges-parquet is required when --doc-pool-source retrieval-parquet")
+        selected_qids = [str(ex.get("qid", f"idx_{i}")) for i, ex in enumerate(examples)]
+        retrieval_doc_pools = load_retrieval_doc_pools_from_parquet(
+            parquet_path=args.retrieval_edges_parquet,
+            qids=selected_qids,
+            topk_docs=args.retrieval_topk_docs,
+            qid_col=args.retrieval_qid_col,
+            doc_col=args.retrieval_doc_col,
+            rank_col=args.retrieval_rank_col,
+            score_col=args.retrieval_score_col,
+        )
+
     rag_model = build_rag_model(device=args.device)
     policy_device = args.policy_device or args.device
     if args.policy_backend == "stub":
@@ -305,6 +565,14 @@ def main():
 
     summary_rows = []
     counts = {}
+    retrieval_diag_counts = {
+        "examples_with_any_gold_in_doc_pool": 0,
+        "examples_with_gold_rank_le_10": 0,
+        "examples_with_gold_rank_le_100": 0,
+        "examples_with_agent_selected_gold_doc": 0,
+        "examples_with_agent_selected_gold_doc_turn1": 0,
+    }
+    best_gold_ranks = []
 
     with args.output_jsonl.open("w") as fout:
         for i, example in enumerate(examples, start=1):
@@ -313,6 +581,22 @@ def main():
             gold_answers = extract_gold_answers(example)
             supporting_doc_ids = extract_supporting_doc_ids(example)
 
+            if args.doc_pool_source == "supporting-docs":
+                doc_pool_entries = [{"doc_id": d, "rank": j + 1, "score": None, "source_rank": None} for j, d in enumerate(supporting_doc_ids)]
+            else:
+                assert retrieval_doc_pools is not None
+                doc_pool_entries = retrieval_doc_pools.get(qid, [])
+            doc_pool_ids = [str(x["doc_id"]) for x in doc_pool_entries]
+            gold_rank_info = compute_gold_doc_rank_info(supporting_doc_ids, doc_pool_ids)
+            best_gold_rank = gold_rank_info["best_gold_doc_rank_in_doc_pool"]
+            if best_gold_rank is not None:
+                retrieval_diag_counts["examples_with_any_gold_in_doc_pool"] += 1
+                best_gold_ranks.append(best_gold_rank)
+                if best_gold_rank <= 10:
+                    retrieval_diag_counts["examples_with_gold_rank_le_10"] += 1
+                if best_gold_rank <= 100:
+                    retrieval_diag_counts["examples_with_gold_rank_le_100"] += 1
+
             started = time.time()
             row = {
                 "example_index": i - 1 + args.start_index,
@@ -320,6 +604,10 @@ def main():
                 "question": question,
                 "gold_answers": gold_answers,
                 "supporting_doc_ids": supporting_doc_ids,
+                "doc_pool_source": args.doc_pool_source,
+                "doc_pool_doc_ids": doc_pool_ids,
+                "doc_pool_size": len(doc_pool_ids),
+                **gold_rank_info,
             }
 
             try:
@@ -327,10 +615,12 @@ def main():
                     raise ValueError("Missing question")
                 if not supporting_doc_ids:
                     raise ValueError("No supporting_doc_ids in example")
+                if not doc_pool_ids:
+                    raise ValueError(f"No doc pool docs for qid={qid} (source={args.doc_pool_source})")
 
                 docid2embs_cpu = {}
                 merged_context_map: dict[str, str] = {}
-                for doc_id in supporting_doc_ids:
+                for doc_id in doc_pool_ids:
                     embs = cache.get_doc_embeddings(doc_id)
                     docid2embs_cpu[doc_id] = embs
                     merged_context_map.update(cache.get_doc_context_map(doc_id))
@@ -358,6 +648,11 @@ def main():
                 reason = payload.get("reason")
                 counts[reason] = counts.get(reason, 0) + 1
                 pred_answer = payload.get("answer")
+                agent_rank_info = compute_agent_selection_rank_info(payload, supporting_doc_ids, doc_pool_ids)
+                if agent_rank_info["selected_any_gold_doc"]:
+                    retrieval_diag_counts["examples_with_agent_selected_gold_doc"] += 1
+                if agent_rank_info["first_turn_with_gold_doc_selected"] == 1:
+                    retrieval_diag_counts["examples_with_agent_selected_gold_doc_turn1"] += 1
                 row.update(
                     {
                         "reason": reason,
@@ -367,12 +662,13 @@ def main():
                             if pred_answer is not None and gold_answers
                             else None
                         ),
+                        **agent_rank_info,
                         "agent": payload,
                     }
                 )
                 logger.info(
                     f"[{i}/{len(examples)}] qid={qid} | reason={reason} | "
-                    f"docs={len(supporting_doc_ids)} | answer={pred_answer}"
+                    f"pool_docs={len(doc_pool_ids)} | best_gold_rank={best_gold_rank} | answer={pred_answer}"
                 )
             except Exception as exc:
                 row.update(
@@ -412,7 +708,18 @@ def main():
             "context_backend": args.context_backend,
             "context_max_chars": args.context_max_chars,
             "max_pages_per_doc": args.max_pages_per_doc,
-            "doc_pool": "supporting_docs_only",
+            "doc_pool": args.doc_pool_source,
+            "retrieval_edges_parquet": (str(args.retrieval_edges_parquet) if args.retrieval_edges_parquet else None),
+            "retrieval_topk_docs": args.retrieval_topk_docs if args.doc_pool_source == "retrieval-parquet" else None,
+        },
+        "retrieval_diagnostics": {
+            **retrieval_diag_counts,
+            "avg_best_gold_doc_rank_in_doc_pool": (
+                sum(best_gold_ranks) / len(best_gold_ranks) if best_gold_ranks else None
+            ),
+            "median_best_gold_doc_rank_in_doc_pool": (
+                sorted(best_gold_ranks)[len(best_gold_ranks) // 2] if best_gold_ranks else None
+            ),
         },
     }
     summary_path.parent.mkdir(parents=True, exist_ok=True)
