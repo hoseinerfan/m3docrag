@@ -13,6 +13,7 @@ an LLM endpoint (OpenAI, vLLM, or local) returning a short text reply.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 from pathlib import Path
 
@@ -29,6 +30,13 @@ def load_doc_embs(path: Path):
     return obj
 
 
+def move_doc_embs(docid2embs, device: str):
+    if device == "cpu":
+        return docid2embs
+    # Smoke tests use a small embedding bundle, so moving it to the GPU is acceptable.
+    return {doc_id: embs.to(device) for doc_id, embs in docid2embs.items()}
+
+
 def make_llm_call_stub():
     def _call(prompt: str) -> str:
         # TODO: replace with real LLM call; for now echo a continue.
@@ -39,13 +47,23 @@ def make_llm_call_stub():
 
 
 def build_rag_model(device: str = "cpu"):
-    retrieval_model = ColPaliRetrievalModel.from_pretrained(
-        model_name_or_path=f"{LOCAL_MODEL_DIR}/colpaligemma-3b-pt-448-base",
+    retrieval_model = ColPaliRetrievalModel(
+        backbone_name_or_path=f"{LOCAL_MODEL_DIR}/colpaligemma-3b-pt-448-base",
         adapter_name_or_path=f"{LOCAL_MODEL_DIR}/colpali-v1.2",
-        device=device,
     )
+    retrieval_model.model = retrieval_model.model.to(device)
     rag_model = MultimodalRAGModel(retrieval_model=retrieval_model, vqa_model=None)
     return rag_model
+
+
+def to_jsonable(obj):
+    if dataclasses.is_dataclass(obj):
+        return {k: to_jsonable(v) for k, v in dataclasses.asdict(obj).items()}
+    if isinstance(obj, dict):
+        return {k: to_jsonable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_jsonable(v) for v in obj]
+    return obj
 
 
 def parse_args():
@@ -62,7 +80,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    docid2embs = load_doc_embs(args.embeddings)
+    docid2embs = move_doc_embs(load_doc_embs(args.embeddings), args.device)
 
     rag_model = build_rag_model(device=args.device)
 
@@ -78,9 +96,8 @@ def main():
         llm_call=make_llm_call_stub(),
     )
 
-    print(json.dumps(result, indent=2))
+    print(json.dumps(to_jsonable(result), indent=2))
 
 
 if __name__ == "__main__":
     main()
-
