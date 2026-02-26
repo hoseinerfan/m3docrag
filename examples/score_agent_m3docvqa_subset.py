@@ -152,6 +152,7 @@ def main():
     missed_with_gold = 0
     by_qtype: dict[str, dict] = {}
     best_gold_ranks = []
+    worst_gold_ranks = []
     gold_in_pool_count = 0
     selected_any_gold_doc_count = 0
     selected_all_gold_doc_count = 0
@@ -184,6 +185,14 @@ def main():
         if not isinstance(gold_doc_ranks_in_pool, dict):
             gold_doc_ranks_in_pool = {}
         gold_docs_in_pool = {str(d) for d in gold_doc_ranks_in_pool.keys()}
+        gold_ranks_in_pool_vals = []
+        for rank_val in gold_doc_ranks_in_pool.values():
+            try:
+                if rank_val is not None:
+                    gold_ranks_in_pool_vals.append(int(rank_val))
+            except Exception:
+                continue
+        worst_gold_rank = max(gold_ranks_in_pool_vals) if gold_ranks_in_pool_vals else None
         selected_gold_docs_any_turn = row.get("selected_gold_docs_any_turn") or []
         if not isinstance(selected_gold_docs_any_turn, list):
             selected_gold_docs_any_turn = []
@@ -241,6 +250,8 @@ def main():
                 best_gold_rank = int(best_gold_rank)
                 gold_in_pool_count += 1
                 best_gold_ranks.append(best_gold_rank)
+                if worst_gold_rank is not None:
+                    worst_gold_ranks.append(int(worst_gold_rank))
                 if best_gold_rank > args.low_rank_threshold:
                     low_rank_with_gold_count += 1
                     if selected_any_gold_doc:
@@ -273,6 +284,7 @@ def main():
                 "reason": reason,
                 "status": status,
                 "best_gold_doc_rank_in_doc_pool": best_gold_rank,
+                "worst_gold_doc_rank_in_doc_pool": worst_gold_rank,
                 "selected_any_gold_doc": selected_any_gold_doc,
                 "selected_all_gold_doc": selected_all_gold_doc,
                 "first_turn_with_gold_doc_selected": first_turn_with_gold_doc_selected,
@@ -308,8 +320,12 @@ def main():
         "gold_in_doc_pool_count": gold_in_pool_count,
         "gold_in_doc_pool_rate": (gold_in_pool_count / total) if total else None,
         "avg_best_gold_doc_rank_in_doc_pool": (sum(best_gold_ranks) / len(best_gold_ranks)) if best_gold_ranks else None,
+        "avg_worst_gold_doc_rank_in_doc_pool": (sum(worst_gold_ranks) / len(worst_gold_ranks)) if worst_gold_ranks else None,
         "mrr_best_gold_doc_in_doc_pool": (
             sum(1.0 / r for r in best_gold_ranks) / len(best_gold_ranks) if best_gold_ranks else None
+        ),
+        "mrr_worst_gold_doc_in_doc_pool": (
+            sum(1.0 / r for r in worst_gold_ranks) / len(worst_gold_ranks) if worst_gold_ranks else None
         ),
         "selected_any_gold_doc_count": selected_any_gold_doc_count,
         "selected_any_gold_doc_rate": (selected_any_gold_doc_count / total) if total else None,
@@ -327,6 +343,13 @@ def main():
         "low_rank_full_rescue_rate": (
             low_rank_full_rescued_count / low_rank_with_gold_count if low_rank_with_gold_count else None
         ),
+        "low_rank_by_worst_with_gold_count": (
+            sum(1 for r in worst_gold_ranks if r > args.low_rank_threshold) if worst_gold_ranks else 0
+        ),
+        "low_rank_by_worst_rescued_count": 0,  # filled below
+        "low_rank_by_worst_full_rescued_count": 0,  # filled below
+        "low_rank_by_worst_rescue_rate": None,  # filled below
+        "low_rank_by_worst_full_rescue_rate": None,  # filled below
         "multi_gold_in_pool_count": multi_gold_in_pool_count,
         "multi_gold_in_pool_selected_any_count": multi_gold_in_pool_selected_any_count,
         "multi_gold_in_pool_selected_all_count": multi_gold_in_pool_selected_all_count,
@@ -337,6 +360,36 @@ def main():
             multi_gold_in_pool_selected_all_count / multi_gold_in_pool_count if multi_gold_in_pool_count else None
         ),
     }
+
+    # Compute "low-rank" using the worst in-pool gold rank (important for multi-gold qids).
+    low_rank_by_worst_with_gold_count = 0
+    low_rank_by_worst_rescued_count = 0
+    low_rank_by_worst_full_rescued_count = 0
+    for d in details:
+        worst_rank = d.get("worst_gold_doc_rank_in_doc_pool")
+        if worst_rank is None:
+            continue
+        try:
+            worst_rank = int(worst_rank)
+        except Exception:
+            continue
+        if worst_rank > args.low_rank_threshold:
+            low_rank_by_worst_with_gold_count += 1
+            if d.get("selected_any_gold_doc"):
+                low_rank_by_worst_rescued_count += 1
+            if d.get("selected_all_gold_doc"):
+                low_rank_by_worst_full_rescued_count += 1
+
+    metrics["low_rank_by_worst_with_gold_count"] = low_rank_by_worst_with_gold_count
+    metrics["low_rank_by_worst_rescued_count"] = low_rank_by_worst_rescued_count
+    metrics["low_rank_by_worst_full_rescued_count"] = low_rank_by_worst_full_rescued_count
+    metrics["low_rank_by_worst_rescue_rate"] = (
+        low_rank_by_worst_rescued_count / low_rank_by_worst_with_gold_count if low_rank_by_worst_with_gold_count else None
+    )
+    metrics["low_rank_by_worst_full_rescue_rate"] = (
+        low_rank_by_worst_full_rescued_count / low_rank_by_worst_with_gold_count
+        if low_rank_by_worst_with_gold_count else None
+    )
 
     print("Metrics")
     print(f"- total_examples: {metrics['total_examples']}")
@@ -359,7 +412,9 @@ def main():
     print(f"- gold_in_doc_pool_count: {metrics['gold_in_doc_pool_count']}")
     print(f"- gold_in_doc_pool_rate: {metrics['gold_in_doc_pool_rate']}")
     print(f"- avg_best_gold_doc_rank_in_doc_pool: {metrics['avg_best_gold_doc_rank_in_doc_pool']}")
+    print(f"- avg_worst_gold_doc_rank_in_doc_pool: {metrics['avg_worst_gold_doc_rank_in_doc_pool']}")
     print(f"- mrr_best_gold_doc_in_doc_pool: {metrics['mrr_best_gold_doc_in_doc_pool']}")
+    print(f"- mrr_worst_gold_doc_in_doc_pool: {metrics['mrr_worst_gold_doc_in_doc_pool']}")
     print(f"- selected_any_gold_doc_count: {metrics['selected_any_gold_doc_count']}")
     print(f"- selected_any_gold_doc_rate: {metrics['selected_any_gold_doc_rate']}")
     print(f"- selected_all_gold_doc_count: {metrics['selected_all_gold_doc_count']}")
@@ -372,6 +427,11 @@ def main():
     print(f"- low_rank_rescue_rate: {metrics['low_rank_rescue_rate']}")
     print(f"- low_rank_full_rescued_count: {metrics['low_rank_full_rescued_count']}")
     print(f"- low_rank_full_rescue_rate: {metrics['low_rank_full_rescue_rate']}")
+    print(f"- low_rank_by_worst_with_gold_count: {metrics['low_rank_by_worst_with_gold_count']}")
+    print(f"- low_rank_by_worst_rescued_count: {metrics['low_rank_by_worst_rescued_count']}")
+    print(f"- low_rank_by_worst_full_rescued_count: {metrics['low_rank_by_worst_full_rescued_count']}")
+    print(f"- low_rank_by_worst_rescue_rate: {metrics['low_rank_by_worst_rescue_rate']}")
+    print(f"- low_rank_by_worst_full_rescue_rate: {metrics['low_rank_by_worst_full_rescue_rate']}")
     print(f"- multi_gold_in_pool_count: {metrics['multi_gold_in_pool_count']}")
     print(f"- multi_gold_in_pool_selected_any_count: {metrics['multi_gold_in_pool_selected_any_count']}")
     print(f"- multi_gold_in_pool_selected_all_count: {metrics['multi_gold_in_pool_selected_all_count']}")
@@ -397,7 +457,8 @@ def main():
                 continue
             print(
                 f"- {d['qid']} | {d['question_type']} | {d['status']} | reason={d['reason']} | "
-                f"gold_rank={d['best_gold_doc_rank_in_doc_pool']} | selected_gold={d['selected_any_gold_doc']} "
+                f"gold_rank={d['best_gold_doc_rank_in_doc_pool']} | worst_gold_rank={d['worst_gold_doc_rank_in_doc_pool']} "
+                f"| selected_gold={d['selected_any_gold_doc']} "
                 f"| selected_all_gold={d['selected_all_gold_doc']} | gold_docs_in_pool={d['num_gold_docs_in_doc_pool']} | "
                 f"pred={d['pred_answer']!r} | gold={d['gold_answers'][:2]}"
             )
