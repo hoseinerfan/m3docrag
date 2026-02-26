@@ -744,6 +744,7 @@ def main():
                     query=question,
                     rag_model=rag_model,
                     docid2embs=docid2embs,
+                    doc_ranked_ids=doc_pool_ids,
                     token2pageuid=None,
                     all_token_embeddings=None,
                     max_turns=args.max_turns,

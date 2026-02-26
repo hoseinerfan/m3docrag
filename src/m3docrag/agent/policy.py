@@ -285,6 +285,10 @@ def _fallback_fact_from_candidate_contexts(
         else:
             overlap = 0
 
+        # Avoid injecting noisy facts that do not anchor to the query at all.
+        if query_tokens and overlap == 0:
+            continue
+
         if overlap < best_score:
             continue
 

@@ -10,6 +10,28 @@ from .memory import AgentMemory, PageRef
 from .policy import AgentPolicy
 
 
+def _page_uid(page: PageRef) -> str:
+    doc_id, page_idx, _ = page
+    return f"{doc_id}#p{page_idx}"
+
+
+def _merge_candidate_lists(*candidate_lists: Sequence[PageRef]) -> list[PageRef]:
+    merged: list[PageRef] = []
+    seen_uids: set[str] = set()
+    for candidate_list in candidate_lists:
+        for page in candidate_list:
+            uid = _page_uid(page)
+            if uid in seen_uids:
+                continue
+            seen_uids.add(uid)
+            merged.append(page)
+    return merged
+
+
+def _norm_query(text: str) -> str:
+    return " ".join((text or "").lower().split())
+
+
 def _seen_doc_ids(memory: AgentMemory) -> set[str]:
     seen: set[str] = set()
     for step in memory.steps:
@@ -31,6 +53,7 @@ def _select_turn_candidates(
     *,
     pages_per_turn: int,
     memory: AgentMemory,
+    exploration_offset: int = 0,
 ) -> list[PageRef]:
     if pages_per_turn <= 0:
         return []
@@ -39,6 +62,13 @@ def _select_turn_candidates(
 
     if not _should_diversify_docs(memory):
         return list(candidates[:pages_per_turn])
+
+    ordered_candidates = list(candidates)
+    if ordered_candidates and exploration_offset > 0:
+        # Rotate candidates so later turns can inspect deeper-ranked documents.
+        offset = exploration_offset % len(ordered_candidates)
+        if offset > 0:
+            ordered_candidates = ordered_candidates[offset:] + ordered_candidates[:offset]
 
     seen_docs_prev_turns = _seen_doc_ids(memory)
     selected: list[PageRef] = []
@@ -56,7 +86,7 @@ def _select_turn_candidates(
         return len(selected) >= pages_per_turn
 
     # Pass 1: prioritize docs never selected in prior turns.
-    for c in candidates:
+    for c in ordered_candidates:
         doc_id = c[0]
         if doc_id in seen_docs_prev_turns or doc_id in selected_doc_ids:
             continue
@@ -64,7 +94,7 @@ def _select_turn_candidates(
             return selected
 
     # Pass 2: preserve doc diversity within the turn, even if docs were seen before.
-    for c in candidates:
+    for c in ordered_candidates:
         doc_id = c[0]
         if doc_id in selected_doc_ids:
             continue
@@ -72,7 +102,7 @@ def _select_turn_candidates(
             return selected
 
     # Pass 3: fill remaining slots by score order.
-    for c in candidates:
+    for c in ordered_candidates:
         if _append_candidate(c):
             return selected
 
@@ -93,6 +123,7 @@ def run_agent_session(
     stop_if_seen: bool = True,
     candidate_context_fn: Optional[Callable[[str, int], Optional[str]]] = None,
     explore_return_pages_multiplier: int = 10,
+    doc_ranked_ids: Optional[Sequence[str]] = None,
 ):
     """Iterative agent loop over the existing RAG model.
 
@@ -108,11 +139,12 @@ def run_agent_session(
         logger.info(f"[turn {turn}] query: {current_query}")
 
         explore_mode = _should_diversify_docs(memory)
+        explore_span = pages_per_turn * max(explore_return_pages_multiplier, 2)
         n_return_pages_turn = n_return_pages
         if explore_mode and turn > 1:
             n_return_pages_turn = max(
                 n_return_pages,
-                pages_per_turn * max(explore_return_pages_multiplier, 2),
+                explore_span * turn,
             )
             logger.info(
                 "exploration retrieval depth active: n_return_pages {} -> {}",
@@ -121,7 +153,7 @@ def run_agent_session(
             )
 
         # 1) retrieve candidates
-        candidates: list[PageRef] = rag_model.retrieve_pages_from_docs(
+        candidates_main: list[PageRef] = rag_model.retrieve_pages_from_docs(
             query=current_query,
             docid2embs=docid2embs,
             index=None,
@@ -130,6 +162,59 @@ def run_agent_session(
             n_return_pages=n_return_pages_turn,
             show_progress=False,
         )
+        candidate_lists: list[list[PageRef]] = [candidates_main]
+
+        if explore_mode and turn > 1 and _norm_query(current_query) != _norm_query(query):
+            candidates_seed = rag_model.retrieve_pages_from_docs(
+                query=query,
+                docid2embs=docid2embs,
+                index=None,
+                token2pageuid=token2pageuid,
+                all_token_embeddings=all_token_embeddings,
+                n_return_pages=n_return_pages_turn,
+                show_progress=False,
+            )
+            candidate_lists.insert(0, candidates_seed)
+            logger.info(
+                "exploration seed-query retrieval active: merged {} seed candidates with {} current-query candidates",
+                len(candidates_seed),
+                len(candidates_main),
+            )
+
+        if explore_mode and turn > 1 and doc_ranked_ids:
+            doc_explore_window = max(explore_span, pages_per_turn * 8)
+            window_start = min(doc_explore_window * (turn - 1), len(doc_ranked_ids))
+            window_end = min(window_start + doc_explore_window, len(doc_ranked_ids))
+            if window_end > window_start:
+                explore_doc_ids = [
+                    doc_id
+                    for doc_id in doc_ranked_ids[window_start:window_end]
+                    if doc_id in docid2embs
+                ]
+            else:
+                explore_doc_ids = []
+            if explore_doc_ids:
+                explore_docid2embs = {doc_id: docid2embs[doc_id] for doc_id in explore_doc_ids}
+                explore_candidates = rag_model.retrieve_pages_from_docs(
+                    query=query,
+                    docid2embs=explore_docid2embs,
+                    index=None,
+                    token2pageuid=token2pageuid,
+                    all_token_embeddings=all_token_embeddings,
+                    n_return_pages=max(n_return_pages, len(explore_doc_ids)),
+                    show_progress=False,
+                )
+                candidate_lists.insert(0, explore_candidates)
+                logger.info(
+                    "rank-window exploration active: docs[{}:{}] -> {} docs, {} candidate pages",
+                    window_start,
+                    window_end,
+                    len(explore_doc_ids),
+                    len(explore_candidates),
+                )
+
+        candidates = _merge_candidate_lists(*candidate_lists)
+        logger.info("merged candidate count before unseen filtering: {}", len(candidates))
 
         if stop_if_seen:
             candidates = memory.unseen(candidates)
@@ -150,12 +235,14 @@ def run_agent_session(
             candidates,
             pages_per_turn=pages_per_turn,
             memory=memory,
+            exploration_offset=(explore_span * (turn - 1)) if explore_mode and turn > 1 else 0,
         )
         if explore_mode:
             logger.info(
-                "doc-diversity selection active: selected {} pages from {} docs",
+                "doc-diversity selection active: selected {} pages from {} docs (offset={})",
                 len(top_for_turn),
                 len({doc_id for doc_id, _, _ in top_for_turn}),
+                (explore_span * (turn - 1)) if turn > 1 else 0,
             )
         candidate_contexts = None
         if candidate_context_fn is not None:
