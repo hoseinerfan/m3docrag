@@ -10,6 +10,75 @@ from .memory import AgentMemory, PageRef
 from .policy import AgentPolicy
 
 
+def _seen_doc_ids(memory: AgentMemory) -> set[str]:
+    seen: set[str] = set()
+    for step in memory.steps:
+        for doc_id, _, _ in step.selected_pages:
+            seen.add(doc_id)
+    return seen
+
+
+def _should_diversify_docs(memory: AgentMemory) -> bool:
+    if memory.facts:
+        return True
+    if memory.steps and memory.steps[-1].action_type == "continue_hop":
+        return True
+    return False
+
+
+def _select_turn_candidates(
+    candidates: Sequence[PageRef],
+    *,
+    pages_per_turn: int,
+    memory: AgentMemory,
+) -> list[PageRef]:
+    if pages_per_turn <= 0:
+        return []
+    if not candidates:
+        return []
+
+    if not _should_diversify_docs(memory):
+        return list(candidates[:pages_per_turn])
+
+    seen_docs_prev_turns = _seen_doc_ids(memory)
+    selected: list[PageRef] = []
+    selected_doc_ids: set[str] = set()
+    selected_page_uids: set[str] = set()
+
+    def _append_candidate(c: PageRef) -> bool:
+        doc_id, page_idx, _ = c
+        uid = f"{doc_id}#p{page_idx}"
+        if uid in selected_page_uids:
+            return False
+        selected.append(c)
+        selected_doc_ids.add(doc_id)
+        selected_page_uids.add(uid)
+        return len(selected) >= pages_per_turn
+
+    # Pass 1: prioritize docs never selected in prior turns.
+    for c in candidates:
+        doc_id = c[0]
+        if doc_id in seen_docs_prev_turns or doc_id in selected_doc_ids:
+            continue
+        if _append_candidate(c):
+            return selected
+
+    # Pass 2: preserve doc diversity within the turn, even if docs were seen before.
+    for c in candidates:
+        doc_id = c[0]
+        if doc_id in selected_doc_ids:
+            continue
+        if _append_candidate(c):
+            return selected
+
+    # Pass 3: fill remaining slots by score order.
+    for c in candidates:
+        if _append_candidate(c):
+            return selected
+
+    return selected
+
+
 def run_agent_session(
     *,
     query: str,
@@ -63,7 +132,17 @@ def run_agent_session(
             )
             return {"answer": None, "reason": "no-new-candidates", "steps": memory.steps}
 
-        top_for_turn = candidates[:pages_per_turn]
+        top_for_turn = _select_turn_candidates(
+            candidates,
+            pages_per_turn=pages_per_turn,
+            memory=memory,
+        )
+        if _should_diversify_docs(memory):
+            logger.info(
+                "doc-diversity selection active: selected {} pages from {} docs",
+                len(top_for_turn),
+                len({doc_id for doc_id, _, _ in top_for_turn}),
+            )
         candidate_contexts = None
         if candidate_context_fn is not None:
             candidate_contexts = []
