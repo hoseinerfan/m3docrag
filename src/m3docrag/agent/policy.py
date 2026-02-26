@@ -216,6 +216,26 @@ def _extract_fact_lines(lines: Sequence[str]) -> list[str]:
     return facts
 
 
+def _fallback_fact_from_candidate_contexts(
+    candidate_contexts: Optional[Sequence[Optional[str]]],
+) -> Optional[str]:
+    if not candidate_contexts:
+        return None
+    for ctx in candidate_contexts:
+        if not ctx:
+            continue
+        text = " ".join(ctx.split()).strip()
+        if len(text) < 24:
+            continue
+        # Keep a short snippet; enough to seed next-hop query without bloating the prompt.
+        text = text[:220]
+        if "." in text:
+            text = text.split(".", 1)[0].strip()
+        if text:
+            return f"Candidate evidence snippet: {text}"
+    return None
+
+
 def _looks_multi_hop_like_query(query: str) -> bool:
     q = " ".join((query or "").lower().split())
     if not q:
@@ -231,6 +251,13 @@ def _looks_multi_hop_like_query(query: str) -> bool:
         r"\baccording to\b",
         r"\bbased on\b",
         r"\bfrom\b.+\bwhich\b",
+        r"\bwhich\b.+\bdid\b",
+        r"\bwho\b.+\bdid\b",
+        r"\bwork(?:ed)? as\b",
+        r"\bvoice actor\b",
+        r"\bvoice actress\b",
+        r"\bdubbed\b",
+        r"\bversion of\b",
     )
     return any(re.search(p, q) for p in patterns)
 
@@ -249,8 +276,11 @@ def _has_nontrivial_candidate_evidence(candidate_contexts: Optional[Sequence[Opt
 def _suggest_hop_query(query: str, facts: Sequence[str]) -> str:
     q = " ".join((query or "").split())
     if facts:
-        return f"Given these facts, what missing clue is still needed to answer: {q}"
-    return f"Find the first supporting clue/entity needed to answer: {q}"
+        return (
+            "Find a different supporting document/page for the missing clue needed to answer: "
+            f"{q}"
+        )
+    return f"Identify one intermediate clue (entity/title/attribute) needed before answering: {q}"
 
 
 def _should_defer_unanswerable(
@@ -260,9 +290,13 @@ def _should_defer_unanswerable(
     candidate_contexts: Optional[Sequence[Optional[str]]],
 ) -> bool:
     # Be conservative: only override early UNANSWERABLE for likely multi-hop questions when we still have evidence to inspect.
-    if not _looks_multi_hop_like_query(query):
+    prior_continue_hop = bool(memory.steps and memory.steps[-1].action_type == "continue_hop")
+    has_fact_memory = bool(getattr(memory, "facts", None))
+    if not (_looks_multi_hop_like_query(query) or prior_continue_hop or has_fact_memory):
         return False
-    if len(memory.steps) >= 2:
+    # Allow a few extra turns once hop behavior has started.
+    max_steps_before_stop = 4 if (prior_continue_hop or has_fact_memory) else 2
+    if len(memory.steps) >= max_steps_before_stop:
         return False
     if not _has_nontrivial_candidate_evidence(candidate_contexts):
         return False
@@ -342,6 +376,16 @@ class AgentPolicy:
             reason = text.split(":", 1)[-1].strip() if ":" in text else ""
             action = {"type": "unanswerable", "text": reason, "chosen": list(candidates), "facts": facts}
 
+        prior_continue_hop = bool(memory.steps and memory.steps[-1].action_type == "continue_hop")
+        likely_multihop = _looks_multi_hop_like_query(query) or prior_continue_hop or bool(getattr(memory, "facts", None))
+
+        # If the model doesn't emit FACT lines, synthesize one lightweight snippet for hop-style continuation.
+        if action["type"] in ("continue", "continue_hop") and not action.get("facts") and likely_multihop:
+            fallback_fact = _fallback_fact_from_candidate_contexts(candidate_contexts)
+            if fallback_fact:
+                logger.debug("Policy synthesized fallback FACT from candidate context")
+                action = {**action, "facts": [fallback_fact]}
+
         # Multi-hop guard: avoid early stopping before collecting enough intermediate evidence.
         if action["type"] == "unanswerable" and _should_defer_unanswerable(
             query=query,
@@ -353,11 +397,11 @@ class AgentPolicy:
             action = {"type": "continue_hop", "text": hop_query, "chosen": list(candidates), "facts": action.get("facts", [])}
 
         # If the LLM asks to continue but simply repeats a multi-hop question, coerce to an explicit hop query.
-        if action["type"] == "continue":
+        if action["type"] in ("continue", "continue_hop"):
             same_query = _normalize_ws(action.get("text", "")) == _normalize_ws(query)
-            if same_query and _looks_multi_hop_like_query(query):
+            if same_query and likely_multihop:
                 hop_query = _suggest_hop_query(query, list(getattr(memory, "facts", [])) + list(action.get("facts", [])))
-                logger.debug(f"Policy CONTINUE QUERY normalized to CONTINUE HOP for likely multi-hop query: {hop_query}")
+                logger.debug(f"Policy repeated continue normalized to CONTINUE HOP for likely multi-hop query: {hop_query}")
                 action = {"type": "continue_hop", "text": hop_query, "chosen": list(candidates), "facts": action.get("facts", [])}
 
         return action
