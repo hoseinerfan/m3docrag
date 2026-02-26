@@ -107,6 +107,45 @@ _NON_TV_CONTEXT_HINTS = (
     " a-side",
 )
 
+_FACT_REJECT_SUBSTRINGS = (
+    "privacy policy",
+    "about wikipedia",
+    "disclaimerscontact wikipedia",
+    "cookie statement",
+    "last edited on",
+    "mobile view",
+)
+
+_FACT_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "of",
+    "in",
+    "on",
+    "for",
+    "to",
+    "and",
+    "or",
+    "by",
+    "with",
+    "from",
+    "at",
+    "as",
+    "is",
+    "are",
+    "was",
+    "were",
+    "did",
+    "does",
+    "who",
+    "which",
+    "what",
+    "when",
+    "where",
+    "how",
+}
+
 
 def _normalize_ws(text: str) -> str:
     return " ".join(text.split())
@@ -217,23 +256,49 @@ def _extract_fact_lines(lines: Sequence[str]) -> list[str]:
 
 
 def _fallback_fact_from_candidate_contexts(
+    query: str,
     candidate_contexts: Optional[Sequence[Optional[str]]],
 ) -> Optional[str]:
     if not candidate_contexts:
         return None
+    query_tokens = {
+        t
+        for t in re.findall(r"[a-z0-9]+", (query or "").lower())
+        if len(t) >= 3 and t not in _FACT_STOPWORDS
+    }
+
+    best_text: Optional[str] = None
+    best_score = -1
+
     for ctx in candidate_contexts:
         if not ctx:
             continue
         text = " ".join(ctx.split()).strip()
         if len(text) < 24:
             continue
+        lower = text.lower()
+        if any(bad in lower for bad in _FACT_REJECT_SUBSTRINGS):
+            continue
+
+        if query_tokens:
+            overlap = len(query_tokens & set(re.findall(r"[a-z0-9]+", lower)))
+        else:
+            overlap = 0
+
+        if overlap < best_score:
+            continue
+
         # Keep a short snippet; enough to seed next-hop query without bloating the prompt.
         text = text[:220]
         if "." in text:
             text = text.split(".", 1)[0].strip()
         if text:
-            return f"Candidate evidence snippet: {text}"
-    return None
+            best_text = text
+            best_score = overlap
+
+    if not best_text:
+        return None
+    return f"Candidate evidence snippet: {best_text}"
 
 
 def _looks_multi_hop_like_query(query: str) -> bool:
@@ -381,7 +446,7 @@ class AgentPolicy:
 
         # If the model doesn't emit FACT lines, synthesize one lightweight snippet for hop-style continuation.
         if action["type"] in ("continue", "continue_hop") and not action.get("facts") and likely_multihop:
-            fallback_fact = _fallback_fact_from_candidate_contexts(candidate_contexts)
+            fallback_fact = _fallback_fact_from_candidate_contexts(query, candidate_contexts)
             if fallback_fact:
                 logger.debug("Policy synthesized fallback FACT from candidate context")
                 action = {**action, "facts": [fallback_fact]}

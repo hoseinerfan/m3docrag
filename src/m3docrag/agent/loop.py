@@ -92,6 +92,7 @@ def run_agent_session(
     n_return_pages: int = 6,
     stop_if_seen: bool = True,
     candidate_context_fn: Optional[Callable[[str, int], Optional[str]]] = None,
+    explore_return_pages_multiplier: int = 10,
 ):
     """Iterative agent loop over the existing RAG model.
 
@@ -106,6 +107,19 @@ def run_agent_session(
     for turn in range(1, max_turns + 1):
         logger.info(f"[turn {turn}] query: {current_query}")
 
+        explore_mode = _should_diversify_docs(memory)
+        n_return_pages_turn = n_return_pages
+        if explore_mode and turn > 1:
+            n_return_pages_turn = max(
+                n_return_pages,
+                pages_per_turn * max(explore_return_pages_multiplier, 2),
+            )
+            logger.info(
+                "exploration retrieval depth active: n_return_pages {} -> {}",
+                n_return_pages,
+                n_return_pages_turn,
+            )
+
         # 1) retrieve candidates
         candidates: list[PageRef] = rag_model.retrieve_pages_from_docs(
             query=current_query,
@@ -113,7 +127,7 @@ def run_agent_session(
             index=None,
             token2pageuid=token2pageuid,
             all_token_embeddings=all_token_embeddings,
-            n_return_pages=n_return_pages,
+            n_return_pages=n_return_pages_turn,
             show_progress=False,
         )
 
@@ -137,7 +151,7 @@ def run_agent_session(
             pages_per_turn=pages_per_turn,
             memory=memory,
         )
-        if _should_diversify_docs(memory):
+        if explore_mode:
             logger.info(
                 "doc-diversity selection active: selected {} pages from {} docs",
                 len(top_for_turn),
