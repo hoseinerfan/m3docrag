@@ -53,7 +53,14 @@ def run_agent_session(
             logger.info(f"filtered to unseen candidates: {len(candidates)}")
 
         if not candidates:
-            memory.add_step(turn, current_query, [], answer=None, stop_reason="no-new-candidates")
+            memory.add_step(
+                turn,
+                current_query,
+                [],
+                answer=None,
+                stop_reason="no-new-candidates",
+                action_type="no-new-candidates",
+            )
             return {"answer": None, "reason": "no-new-candidates", "steps": memory.steps}
 
         top_for_turn = candidates[:pages_per_turn]
@@ -77,17 +84,42 @@ def run_agent_session(
             llm_call=llm_call,
             candidate_contexts=candidate_contexts,
         )
+        added_facts = memory.add_facts(action.get("facts", []))
 
         if action["type"] == "answer":
-            memory.add_step(turn, current_query, top_for_turn, answer=action["text"], stop_reason="answered")
+            memory.add_step(
+                turn,
+                current_query,
+                top_for_turn,
+                answer=action["text"],
+                stop_reason="answered",
+                action_type=action["type"],
+                facts_added=added_facts,
+            )
             return {"answer": action["text"], "reason": "answered", "steps": memory.steps}
 
         if action["type"] == "unanswerable":
-            memory.add_step(turn, current_query, top_for_turn, answer=None, stop_reason="unanswerable")
+            memory.add_step(
+                turn,
+                current_query,
+                top_for_turn,
+                answer=None,
+                stop_reason="unanswerable",
+                action_type=action["type"],
+                facts_added=added_facts,
+            )
             return {"answer": None, "reason": "unanswerable", "steps": memory.steps}
 
         # continue
-        memory.add_step(turn, current_query, top_for_turn, answer=None, stop_reason=None)
+        memory.add_step(
+            turn,
+            current_query,
+            top_for_turn,
+            answer=None,
+            stop_reason=None,
+            action_type=action["type"],
+            facts_added=added_facts,
+        )
         current_query = action["text"] or current_query
 
     return {"answer": None, "reason": "max_turns", "steps": memory.steps}

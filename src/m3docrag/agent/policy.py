@@ -13,7 +13,7 @@ from .memory import AgentMemory, PageRef
 AGENT_PROMPT = dedent(
     """
     You are a concise research agent answering document questions with a tight page budget.
-    You have: a question, previously seen pages, and newly retrieved candidate pages (with brief summaries).
+    You have: a question, known intermediate facts, previously seen pages, and newly retrieved candidate pages (with brief summaries).
 
     Tools you can implicitly call:
     - READ: read provided candidate pages (you already have their summaries; use them to decide).
@@ -22,14 +22,19 @@ AGENT_PROMPT = dedent(
     Policy:
     1) If a candidate page directly contains the answer, respond with ANSWER: <short answer> and STOP.
        If the question asks for a title/name and a candidate summary explicitly contains that title/name, answer immediately.
-    2) Otherwise, pick the smallest subset of candidate pages that likely advance the answer and say CONTINUE with a refined query if needed.
+    2) For multi-hop questions, prefer decomposing into a single-hop subquestion and respond with CONTINUE HOP.
+       You may extract and store intermediate facts from evidence using FACT lines.
+    3) Otherwise, pick the smallest subset of candidate pages that likely advance the answer and say CONTINUE with a refined query if needed.
        Do NOT repeat the same question as CONTINUE QUERY unless you substantially refine it.
-    3) If stuck or evidence is insufficient, respond with UNANSWERABLE and STOP.
+    4) If stuck or evidence is insufficient, respond with UNANSWERABLE and STOP.
 
-    Format your reply as one of:
+    Reply format:
     - ANSWER: <text>
     - CONTINUE QUERY: <refined query>
+    - CONTINUE HOP: <single-hop subquestion>
     - UNANSWERABLE: <reason>
+    Optional additional lines after the first line:
+    - FACT: <intermediate fact>
     """
 )
 
@@ -195,6 +200,21 @@ def _maybe_direct_answer_from_context(
     return None
 
 
+def _extract_fact_lines(lines: Sequence[str]) -> list[str]:
+    facts: list[str] = []
+    for line in lines:
+        if not isinstance(line, str):
+            continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith("fact:"):
+            fact = stripped.split(":", 1)[1].strip()
+            if fact:
+                facts.append(fact)
+    return facts
+
+
 @dataclass
 class AgentPolicy:
     """Lightweight heuristic policy wrapping an LLM (prompt provided to caller)."""
@@ -220,6 +240,8 @@ class AgentPolicy:
         prompt_parts: List[str] = [AGENT_PROMPT]
 
         prompt_parts.append(f"QUESTION: {query}")
+        if getattr(memory, "facts", None):
+            prompt_parts.append("KNOWN FACTS:\n" + "\n".join([f"- {fact}" for fact in memory.facts]))
         if memory.steps:
             prompt_parts.append(
                 "SEEN PAGES:\n"
@@ -242,20 +264,28 @@ class AgentPolicy:
         raw = llm_call(full_prompt)
         logger.debug(f"LLM raw reply: {raw}")
 
-        action = {"type": "continue", "text": query, "chosen": list(candidates)}
+        action = {"type": "continue", "text": query, "chosen": list(candidates), "facts": []}
 
         if raw is None:
             return action
 
-        text = raw.strip()
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        if not lines:
+            return action
+
+        facts = _extract_fact_lines(lines[1:])
+        text = lines[0]
         lower = text.lower()
         if lower.startswith("answer:"):
-            action = {"type": "answer", "text": text[len("answer:") :].strip(), "chosen": list(candidates)}
+            action = {"type": "answer", "text": text[len("answer:") :].strip(), "chosen": list(candidates), "facts": facts}
         elif lower.startswith("continue query:"):
             refined = text[len("continue query:") :].strip()
-            action = {"type": "continue", "text": refined or query, "chosen": list(candidates)}
+            action = {"type": "continue", "text": refined or query, "chosen": list(candidates), "facts": facts}
+        elif lower.startswith("continue hop:"):
+            refined = text[len("continue hop:") :].strip()
+            action = {"type": "continue_hop", "text": refined or query, "chosen": list(candidates), "facts": facts}
         elif lower.startswith("unanswerable"):
             reason = text.split(":", 1)[-1].strip() if ":" in text else ""
-            action = {"type": "unanswerable", "text": reason, "chosen": list(candidates)}
+            action = {"type": "unanswerable", "text": reason, "chosen": list(candidates), "facts": facts}
 
         return action

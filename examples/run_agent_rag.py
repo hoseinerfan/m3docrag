@@ -148,14 +148,17 @@ def make_llm_call_stub():
 def _normalize_policy_output(raw: str, prompt: str) -> str:
     if raw is None:
         raw = ""
-    line = raw.strip().splitlines()[0].strip() if raw.strip() else ""
+    lines = [ln.strip() for ln in raw.strip().splitlines() if ln.strip()] if raw.strip() else []
+    line = lines[0] if lines else ""
     lower = line.lower()
     if (
         lower.startswith("answer:")
         or lower.startswith("continue query:")
+        or lower.startswith("continue hop:")
         or lower.startswith("unanswerable")
     ):
-        return line
+        fact_lines = [ln for ln in lines[1:] if ln.lower().startswith("fact:")]
+        return "\n".join([line] + fact_lines) if fact_lines else line
     question = prompt.split("QUESTION:")[-1].strip().split("\n")[0]
     return f"CONTINUE QUERY: {question}"
 
@@ -186,8 +189,10 @@ def make_llm_call_local_hf(model_name_or_path: str, device: str = "cuda"):
         dtype = torch.float32
 
     system_prompt = (
-        "Return exactly one line in one of these formats only: "
-        "ANSWER: <text> OR CONTINUE QUERY: <text> OR UNANSWERABLE: <reason>."
+        "Return one action line using exactly one format: "
+        "ANSWER: <text> OR CONTINUE QUERY: <text> OR CONTINUE HOP: <single-hop subquestion> "
+        "OR UNANSWERABLE: <reason>. "
+        "You may optionally add extra lines beginning with 'FACT:' to store intermediate facts."
     )
 
     if getattr(config, "model_type", "") == "qwen2_vl":
