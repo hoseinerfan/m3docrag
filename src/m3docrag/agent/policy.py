@@ -24,6 +24,7 @@ AGENT_PROMPT = dedent(
        If the question asks for a title/name and a candidate summary explicitly contains that title/name, answer immediately.
     2) For multi-hop questions, prefer decomposing into a single-hop subquestion and respond with CONTINUE HOP.
        You may extract and store intermediate facts from evidence using FACT lines.
+       Do not stop after finding only one likely entity if the question still requires a relation/attribute/second clue.
     3) Otherwise, pick the smallest subset of candidate pages that likely advance the answer and say CONTINUE with a refined query if needed.
        Do NOT repeat the same question as CONTINUE QUERY unless you substantially refine it.
     4) If stuck or evidence is insufficient, respond with UNANSWERABLE and STOP.
@@ -215,6 +216,59 @@ def _extract_fact_lines(lines: Sequence[str]) -> list[str]:
     return facts
 
 
+def _looks_multi_hop_like_query(query: str) -> bool:
+    q = " ".join((query or "").lower().split())
+    if not q:
+        return False
+    patterns = (
+        r"\bwho\b.*\bthat\b",
+        r"\bwhich\b.*\bthat\b",
+        r"\bwhose\b",
+        r"\bwho\b.*\bwith\b",
+        r"\bwhich\b.*\bwith\b",
+        r"\bin\b.+\bwho\b",
+        r"\bin\b.+\bwhich\b",
+        r"\baccording to\b",
+        r"\bbased on\b",
+        r"\bfrom\b.+\bwhich\b",
+    )
+    return any(re.search(p, q) for p in patterns)
+
+
+def _has_nontrivial_candidate_evidence(candidate_contexts: Optional[Sequence[Optional[str]]]) -> bool:
+    if not candidate_contexts:
+        return False
+    for c in candidate_contexts:
+        if not c:
+            continue
+        if len(c.strip()) >= 24:
+            return True
+    return False
+
+
+def _suggest_hop_query(query: str, facts: Sequence[str]) -> str:
+    q = " ".join((query or "").split())
+    if facts:
+        return f"Given these facts, what missing clue is still needed to answer: {q}"
+    return f"Find the first supporting clue/entity needed to answer: {q}"
+
+
+def _should_defer_unanswerable(
+    *,
+    query: str,
+    memory: AgentMemory,
+    candidate_contexts: Optional[Sequence[Optional[str]]],
+) -> bool:
+    # Be conservative: only override early UNANSWERABLE for likely multi-hop questions when we still have evidence to inspect.
+    if not _looks_multi_hop_like_query(query):
+        return False
+    if len(memory.steps) >= 2:
+        return False
+    if not _has_nontrivial_candidate_evidence(candidate_contexts):
+        return False
+    return True
+
+
 @dataclass
 class AgentPolicy:
     """Lightweight heuristic policy wrapping an LLM (prompt provided to caller)."""
@@ -287,5 +341,23 @@ class AgentPolicy:
         elif lower.startswith("unanswerable"):
             reason = text.split(":", 1)[-1].strip() if ":" in text else ""
             action = {"type": "unanswerable", "text": reason, "chosen": list(candidates), "facts": facts}
+
+        # Multi-hop guard: avoid early stopping before collecting enough intermediate evidence.
+        if action["type"] == "unanswerable" and _should_defer_unanswerable(
+            query=query,
+            memory=memory,
+            candidate_contexts=candidate_contexts,
+        ):
+            hop_query = _suggest_hop_query(query, list(getattr(memory, "facts", [])) + list(action.get("facts", [])))
+            logger.debug(f"Policy UNANSWERABLE overridden to CONTINUE HOP for likely multi-hop query: {hop_query}")
+            action = {"type": "continue_hop", "text": hop_query, "chosen": list(candidates), "facts": action.get("facts", [])}
+
+        # If the LLM asks to continue but simply repeats a multi-hop question, coerce to an explicit hop query.
+        if action["type"] == "continue":
+            same_query = _normalize_ws(action.get("text", "")) == _normalize_ws(query)
+            if same_query and _looks_multi_hop_like_query(query):
+                hop_query = _suggest_hop_query(query, list(getattr(memory, "facts", [])) + list(action.get("facts", [])))
+                logger.debug(f"Policy CONTINUE QUERY normalized to CONTINUE HOP for likely multi-hop query: {hop_query}")
+                action = {"type": "continue_hop", "text": hop_query, "chosen": list(candidates), "facts": action.get("facts", [])}
 
         return action
