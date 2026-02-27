@@ -27,6 +27,8 @@ class StepRecord:
         Policy action selected for this turn (answer/continue/continue_hop/unanswerable).
     facts_added : list[str]
         New intermediate facts stored from this turn.
+    retrieval_traces : list[dict]
+        Per-query retrieval diagnostics for this turn (query text + top candidates).
     """
 
     turn: int
@@ -36,6 +38,7 @@ class StepRecord:
     stop_reason: Optional[str] = None
     action_type: Optional[str] = None
     facts_added: List[str] = field(default_factory=list)
+    retrieval_traces: List[dict] = field(default_factory=list)
 
 
 @dataclass
@@ -59,6 +62,7 @@ class AgentMemory:
         stop_reason: Optional[str] = None,
         action_type: Optional[str] = None,
         facts_added: Sequence[str] = (),
+        retrieval_traces: Sequence[dict] = (),
     ) -> None:
         for doc_id, page_idx, _ in selected_pages:
             self.seen_pages.add(self.page_uid(doc_id, page_idx))
@@ -71,6 +75,7 @@ class AgentMemory:
                 stop_reason=stop_reason,
                 action_type=action_type,
                 facts_added=list(facts_added),
+                retrieval_traces=list(retrieval_traces),
             )
         )
 

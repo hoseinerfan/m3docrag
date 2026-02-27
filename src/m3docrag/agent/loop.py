@@ -79,6 +79,32 @@ def _select_seed_candidates_from_query_lists(
     return seeds
 
 
+def _top_pages_payload(candidates: Sequence[PageRef], *, limit: int = 20) -> list[dict]:
+    return [
+        {"doc_id": doc_id, "page_idx": int(page_idx), "score": float(score)}
+        for doc_id, page_idx, score in list(candidates)[:limit]
+    ]
+
+
+def _top_docs_payload(candidates: Sequence[PageRef], *, limit: int = 20) -> list[dict]:
+    out: list[dict] = []
+    seen_docs: set[str] = set()
+    for doc_id, page_idx, score in candidates:
+        if doc_id in seen_docs:
+            continue
+        seen_docs.add(doc_id)
+        out.append(
+            {
+                "doc_id": doc_id,
+                "best_page_idx": int(page_idx),
+                "best_page_score": float(score),
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _slice_rank_window(
     ranked_ids: Sequence[str],
     *,
@@ -248,6 +274,7 @@ def run_agent_session(
             logger.info("multi-query retrieval active: {} queries", len(retrieval_queries))
 
         query_candidate_lists: list[list[PageRef]] = []
+        retrieval_traces: list[dict] = []
         for i, retrieval_query in enumerate(retrieval_queries, start=1):
             retrieved = rag_model.retrieve_pages_from_docs(
                 query=retrieval_query,
@@ -265,6 +292,22 @@ def run_agent_session(
                 len(retrieval_queries),
                 len(retrieved),
                 retrieval_query,
+            )
+            top_docs = _top_docs_payload(retrieved, limit=min(20, max(pages_per_turn * 4, 8)))
+            retrieval_traces.append(
+                {
+                    "query": retrieval_query,
+                    "returned_page_count": len(retrieved),
+                    "top_pages": _top_pages_payload(
+                        retrieved, limit=min(20, max(pages_per_turn * 4, 8))
+                    ),
+                    "top_docs": top_docs,
+                }
+            )
+            logger.info(
+                "retrieval query [{}] top docs: {}",
+                i,
+                [x["doc_id"] for x in top_docs[: min(5, len(top_docs))]],
             )
         candidate_lists: list[list[PageRef]] = list(query_candidate_lists)
         candidates_main = query_candidate_lists[0] if query_candidate_lists else []
@@ -356,6 +399,7 @@ def run_agent_session(
                 answer=None,
                 stop_reason="no-new-candidates",
                 action_type="no-new-candidates",
+                retrieval_traces=retrieval_traces,
             )
             return {"answer": None, "reason": "no-new-candidates", "steps": memory.steps}
 
@@ -432,6 +476,7 @@ def run_agent_session(
                 stop_reason="answered",
                 action_type=action["type"],
                 facts_added=added_facts,
+                retrieval_traces=retrieval_traces,
             )
             return {"answer": action["text"], "reason": "answered", "steps": memory.steps}
 
@@ -444,6 +489,7 @@ def run_agent_session(
                 stop_reason="unanswerable",
                 action_type=action["type"],
                 facts_added=added_facts,
+                retrieval_traces=retrieval_traces,
             )
             return {"answer": None, "reason": "unanswerable", "steps": memory.steps}
 
@@ -456,6 +502,7 @@ def run_agent_session(
             stop_reason=None,
             action_type=action["type"],
             facts_added=added_facts,
+            retrieval_traces=retrieval_traces,
         )
         pending_hop_queries = _dedupe_queries(action.get("hop_queries", []))
         current_query = action["text"] or current_query
