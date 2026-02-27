@@ -36,6 +36,7 @@ AGENT_PROMPT = dedent(
     - UNANSWERABLE: <reason>
     Optional additional lines after the first line:
     - FACT: <intermediate fact>
+    - HOP_QUERY: <independent subquery for retrieval>
     """
 )
 
@@ -266,6 +267,36 @@ def _extract_fact_lines(lines: Sequence[str]) -> list[str]:
     return facts
 
 
+def _extract_hop_query_lines(lines: Sequence[str]) -> list[str]:
+    queries: list[str] = []
+    for line in lines:
+        if not isinstance(line, str):
+            continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith("hop_query:"):
+            q = stripped.split(":", 1)[1].strip()
+            if q:
+                queries.append(q)
+    return queries
+
+
+def _dedupe_queries(queries: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        q = _normalize_ws(query)
+        if not q:
+            continue
+        key = q.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(q)
+    return out
+
+
 def _fallback_fact_from_candidate_contexts(
     query: str,
     candidate_contexts: Optional[Sequence[Optional[str]]],
@@ -407,6 +438,49 @@ def _suggest_hop_query(query: str, facts: Sequence[str]) -> str:
     return f"Identify one intermediate clue (entity/title/attribute) needed before answering: {q}"
 
 
+def _suggest_hop_queries(query: str, facts: Sequence[str]) -> list[str]:
+    q = " ".join((query or "").split())
+    q_lower = q.lower()
+    years = re.findall(r"\b(?:19|20)\d{2}\b", q)
+    year_text = years[0] if years else ""
+    entities = []
+    for m in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b", q):
+        ent = m.group(1).strip()
+        if ent.lower() in _HOP_QUERY_STOP_PHRASES:
+            continue
+        entities.append(ent)
+    person_anchor = entities[0] if entities else ""
+    relation_parts = []
+    if "voice actress" in q_lower:
+        relation_parts.append("voice actress")
+    elif "voice actor" in q_lower:
+        relation_parts.append("voice actor")
+    if "dubbed" in q_lower:
+        relation_parts.append("dubbed")
+    if "tamil" in q_lower:
+        relation_parts.append("tamil")
+    if "film" in q_lower:
+        relation_parts.append("film")
+    elif "movie" in q_lower:
+        relation_parts.append("movie")
+    relation_text = " ".join(relation_parts).strip()
+
+    queries: list[str] = []
+    if person_anchor:
+        parts = [person_anchor, relation_text, year_text]
+        first_hop = " ".join([p for p in parts if p]).strip()
+        if first_hop:
+            queries.append(first_hop)
+    if "which " in q_lower and (" movie" in q_lower or " film" in q_lower):
+        focus = re.sub(r"^which\s+", "", q, flags=re.IGNORECASE)
+        if focus:
+            queries.append(focus)
+    if person_anchor and relation_text:
+        queries.append(f"{person_anchor} {relation_text}")
+    queries.append(_suggest_hop_query(query, facts))
+    return _dedupe_queries(queries)[:3]
+
+
 def _is_near_duplicate_query(a: str, b: str) -> bool:
     ta = [t for t in re.findall(r"[a-z0-9]+", (a or "").lower()) if t not in _FACT_STOPWORDS]
     tb = [t for t in re.findall(r"[a-z0-9]+", (b or "").lower()) if t not in _FACT_STOPWORDS]
@@ -509,7 +583,7 @@ class AgentPolicy:
         raw = llm_call(full_prompt)
         logger.debug(f"LLM raw reply: {raw}")
 
-        action = {"type": "continue", "text": query, "chosen": list(candidates), "facts": []}
+        action = {"type": "continue", "text": query, "chosen": list(candidates), "facts": [], "hop_queries": []}
 
         if raw is None:
             return action
@@ -519,19 +593,44 @@ class AgentPolicy:
             return action
 
         facts = _extract_fact_lines(lines[1:])
+        hop_queries = _extract_hop_query_lines(lines[1:])
         text = lines[0]
         lower = text.lower()
         if lower.startswith("answer:"):
-            action = {"type": "answer", "text": text[len("answer:") :].strip(), "chosen": list(candidates), "facts": facts}
+            action = {
+                "type": "answer",
+                "text": text[len("answer:") :].strip(),
+                "chosen": list(candidates),
+                "facts": facts,
+                "hop_queries": [],
+            }
         elif lower.startswith("continue query:"):
             refined = text[len("continue query:") :].strip()
-            action = {"type": "continue", "text": refined or query, "chosen": list(candidates), "facts": facts}
+            action = {
+                "type": "continue",
+                "text": refined or query,
+                "chosen": list(candidates),
+                "facts": facts,
+                "hop_queries": _dedupe_queries(hop_queries),
+            }
         elif lower.startswith("continue hop:"):
             refined = text[len("continue hop:") :].strip()
-            action = {"type": "continue_hop", "text": refined or query, "chosen": list(candidates), "facts": facts}
+            action = {
+                "type": "continue_hop",
+                "text": refined or query,
+                "chosen": list(candidates),
+                "facts": facts,
+                "hop_queries": _dedupe_queries(hop_queries),
+            }
         elif lower.startswith("unanswerable"):
             reason = text.split(":", 1)[-1].strip() if ":" in text else ""
-            action = {"type": "unanswerable", "text": reason, "chosen": list(candidates), "facts": facts}
+            action = {
+                "type": "unanswerable",
+                "text": reason,
+                "chosen": list(candidates),
+                "facts": facts,
+                "hop_queries": [],
+            }
 
         prior_continue_hop = bool(memory.steps and memory.steps[-1].action_type == "continue_hop")
         likely_multihop = _looks_multi_hop_like_query(query) or prior_continue_hop or bool(getattr(memory, "facts", None))
@@ -551,7 +650,15 @@ class AgentPolicy:
         ):
             hop_query = _suggest_hop_query(query, list(getattr(memory, "facts", [])) + list(action.get("facts", [])))
             logger.debug(f"Policy UNANSWERABLE overridden to CONTINUE HOP for likely multi-hop query: {hop_query}")
-            action = {"type": "continue_hop", "text": hop_query, "chosen": list(candidates), "facts": action.get("facts", [])}
+            action = {
+                "type": "continue_hop",
+                "text": hop_query,
+                "chosen": list(candidates),
+                "facts": action.get("facts", []),
+                "hop_queries": _suggest_hop_queries(
+                    query, list(getattr(memory, "facts", [])) + list(action.get("facts", []))
+                ),
+            }
 
         # If the LLM asks to continue but simply repeats a multi-hop question, coerce to an explicit hop query.
         if action["type"] in ("continue", "continue_hop"):
@@ -565,6 +672,23 @@ class AgentPolicy:
                     list(getattr(memory, "facts", [])) + list(action.get("facts", [])),
                 )
                 logger.debug(f"Policy repeated continue normalized to CONTINUE HOP for likely multi-hop query: {hop_query}")
-                action = {"type": "continue_hop", "text": hop_query, "chosen": list(candidates), "facts": action.get("facts", [])}
+                action = {
+                    "type": "continue_hop",
+                    "text": hop_query,
+                    "chosen": list(candidates),
+                    "facts": action.get("facts", []),
+                    "hop_queries": _suggest_hop_queries(
+                        query, list(getattr(memory, "facts", [])) + list(action.get("facts", []))
+                    ),
+                }
+
+        if action["type"] == "continue_hop":
+            suggested_hops = _suggest_hop_queries(
+                query, list(getattr(memory, "facts", [])) + list(action.get("facts", []))
+            )
+            hop_queries = _dedupe_queries(list(action.get("hop_queries", [])) + suggested_hops)
+            if action.get("text"):
+                hop_queries = _dedupe_queries([action["text"]] + hop_queries)
+            action = {**action, "hop_queries": hop_queries[:3]}
 
         return action

@@ -32,6 +32,53 @@ def _norm_query(text: str) -> str:
     return " ".join((text or "").lower().split())
 
 
+def _norm_query_key(text: str) -> str:
+    return _norm_query(text)
+
+
+def _dedupe_queries(queries: Sequence[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for query in queries:
+        q = " ".join((query or "").split())
+        if not q:
+            continue
+        key = _norm_query_key(q)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(q)
+    return out
+
+
+def _select_seed_candidates_from_query_lists(
+    query_candidate_lists: Sequence[Sequence[PageRef]],
+    *,
+    pages_per_turn: int,
+    allowed_uids: set[str],
+) -> list[PageRef]:
+    if pages_per_turn <= 0:
+        return []
+    seeds: list[PageRef] = []
+    selected_uids: set[str] = set()
+    selected_doc_ids: set[str] = set()
+    for cand_list in query_candidate_lists:
+        for candidate in cand_list:
+            uid = _page_uid(candidate)
+            if uid not in allowed_uids or uid in selected_uids:
+                continue
+            doc_id = candidate[0]
+            if doc_id in selected_doc_ids:
+                continue
+            selected_uids.add(uid)
+            selected_doc_ids.add(doc_id)
+            seeds.append(candidate)
+            break
+        if len(seeds) >= pages_per_turn:
+            break
+    return seeds
+
+
 def _slice_rank_window(
     ranked_ids: Sequence[str],
     *,
@@ -176,6 +223,7 @@ def run_agent_session(
     policy = AgentPolicy()
 
     current_query = query
+    pending_hop_queries: list[str] = []
     for turn in range(1, max_turns + 1):
         logger.info(f"[turn {turn}] query: {current_query}")
 
@@ -194,16 +242,32 @@ def run_agent_session(
             )
 
         # 1) retrieve candidates
-        candidates_main: list[PageRef] = rag_model.retrieve_pages_from_docs(
-            query=current_query,
-            docid2embs=docid2embs,
-            index=None,
-            token2pageuid=token2pageuid,
-            all_token_embeddings=all_token_embeddings,
-            n_return_pages=n_return_pages_turn,
-            show_progress=False,
-        )
-        candidate_lists: list[list[PageRef]] = [candidates_main]
+        retrieval_queries = [current_query]
+        if explore_mode and pending_hop_queries:
+            retrieval_queries = _dedupe_queries([current_query] + pending_hop_queries)
+            logger.info("multi-query retrieval active: {} queries", len(retrieval_queries))
+
+        query_candidate_lists: list[list[PageRef]] = []
+        for i, retrieval_query in enumerate(retrieval_queries, start=1):
+            retrieved = rag_model.retrieve_pages_from_docs(
+                query=retrieval_query,
+                docid2embs=docid2embs,
+                index=None,
+                token2pageuid=token2pageuid,
+                all_token_embeddings=all_token_embeddings,
+                n_return_pages=n_return_pages_turn,
+                show_progress=False,
+            )
+            query_candidate_lists.append(retrieved)
+            logger.info(
+                "retrieval query [{} / {}]: {} candidates | {}",
+                i,
+                len(retrieval_queries),
+                len(retrieved),
+                retrieval_query,
+            )
+        candidate_lists: list[list[PageRef]] = list(query_candidate_lists)
+        candidates_main = query_candidate_lists[0] if query_candidate_lists else []
 
         if explore_mode and turn > 1 and _norm_query(current_query) != _norm_query(query):
             candidates_seed = rag_model.retrieve_pages_from_docs(
@@ -295,12 +359,41 @@ def run_agent_session(
             )
             return {"answer": None, "reason": "no-new-candidates", "steps": memory.steps}
 
-        top_for_turn = _select_turn_candidates(
-            candidates,
-            pages_per_turn=pages_per_turn,
-            memory=memory,
-            exploration_offset=(explore_span * (turn - 1)) if explore_mode and turn > 1 else 0,
-        )
+        top_for_turn: list[PageRef] = []
+        if len(retrieval_queries) > 1:
+            allowed_uids = {_page_uid(c) for c in candidates}
+            seed_candidates = _select_seed_candidates_from_query_lists(
+                query_candidate_lists,
+                pages_per_turn=pages_per_turn,
+                allowed_uids=allowed_uids,
+            )
+            if seed_candidates:
+                seed_uids = {_page_uid(c) for c in seed_candidates}
+                remainder = [c for c in candidates if _page_uid(c) not in seed_uids]
+                remainder_budget = max(0, pages_per_turn - len(seed_candidates))
+                if remainder_budget > 0:
+                    remainder_selected = _select_turn_candidates(
+                        remainder,
+                        pages_per_turn=remainder_budget,
+                        memory=memory,
+                        exploration_offset=(explore_span * (turn - 1)) if explore_mode and turn > 1 else 0,
+                    )
+                else:
+                    remainder_selected = []
+                top_for_turn = seed_candidates + remainder_selected
+                logger.info(
+                    "multi-query seed selection: {} seeded + {} remainder",
+                    len(seed_candidates),
+                    len(remainder_selected),
+                )
+
+        if not top_for_turn:
+            top_for_turn = _select_turn_candidates(
+                candidates,
+                pages_per_turn=pages_per_turn,
+                memory=memory,
+                exploration_offset=(explore_span * (turn - 1)) if explore_mode and turn > 1 else 0,
+            )
         if explore_mode:
             logger.info(
                 "doc-diversity selection active: selected {} pages from {} docs (offset={})",
@@ -364,6 +457,7 @@ def run_agent_session(
             action_type=action["type"],
             facts_added=added_facts,
         )
+        pending_hop_queries = _dedupe_queries(action.get("hop_queries", []))
         current_query = action["text"] or current_query
 
     return {"answer": None, "reason": "max_turns", "steps": memory.steps}
