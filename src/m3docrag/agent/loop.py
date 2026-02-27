@@ -259,6 +259,7 @@ def run_agent_session(
     memory = AgentMemory()
     policy = AgentPolicy()
 
+    root_query = query
     current_query = query
     pending_hop_queries: list[str] = []
     active_hop_index = 0
@@ -288,7 +289,7 @@ def run_agent_session(
             prev_hop_answer = resolved_hop_answers.get(active_hop_index - 1)
             if prev_hop_answer:
                 hop_query = f"{hop_query} {prev_hop_answer}"
-            retrieval_queries = _dedupe_queries([hop_query, current_query])
+            retrieval_queries = _dedupe_queries([hop_query, root_query])
             logger.info(
                 "sequential hop retrieval active: hop {} / {} (prev_answer={})",
                 active_hop_index + 1,
@@ -336,9 +337,14 @@ def run_agent_session(
         candidate_lists: list[list[PageRef]] = list(query_candidate_lists)
         candidates_main = query_candidate_lists[0] if query_candidate_lists else []
 
-        if explore_mode and turn > 1 and _norm_query(current_query) != _norm_query(query):
+        if (
+            explore_mode
+            and turn > 1
+            and not pending_hop_queries
+            and _norm_query(current_query) != _norm_query(root_query)
+        ):
             candidates_seed = rag_model.retrieve_pages_from_docs(
-                query=query,
+                query=root_query,
                 docid2embs=docid2embs,
                 index=None,
                 token2pageuid=token2pageuid,
@@ -353,7 +359,7 @@ def run_agent_session(
                 len(candidates_main),
             )
 
-        if explore_mode and turn > 1 and doc_ranked_ids:
+        if explore_mode and turn > 1 and doc_ranked_ids and not pending_hop_queries:
             doc_explore_window = max(explore_span, pages_per_turn * 8)
             window_start = min(doc_explore_window * (turn - 1), len(doc_ranked_ids))
             head_explore_doc_ids = _slice_rank_window(
@@ -365,7 +371,7 @@ def run_agent_session(
             if head_explore_doc_ids:
                 explore_candidates = _retrieve_rank_window_candidates(
                     rag_model=rag_model,
-                    query=query,
+                    query=root_query,
                     explore_doc_ids=head_explore_doc_ids,
                     docid2embs=docid2embs,
                     token2pageuid=token2pageuid,
@@ -392,7 +398,7 @@ def run_agent_session(
             if tail_explore_doc_ids:
                 tail_candidates = _retrieve_rank_window_candidates(
                     rag_model=rag_model,
-                    query=query,
+                    query=root_query,
                     explore_doc_ids=tail_explore_doc_ids,
                     docid2embs=docid2embs,
                     token2pageuid=token2pageuid,
