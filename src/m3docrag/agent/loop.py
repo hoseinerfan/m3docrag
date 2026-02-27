@@ -51,6 +51,17 @@ def _dedupe_queries(queries: Sequence[str]) -> list[str]:
     return out
 
 
+def _normalize_hop_answer(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    value = " ".join(str(text).split()).strip()
+    if not value:
+        return None
+    if value.lower() in {"unknown", "n/a", "none", "not found"}:
+        return None
+    return value[:160]
+
+
 def _select_seed_candidates_from_query_lists(
     query_candidate_lists: Sequence[Sequence[PageRef]],
     *,
@@ -250,6 +261,8 @@ def run_agent_session(
 
     current_query = query
     pending_hop_queries: list[str] = []
+    active_hop_index = 0
+    resolved_hop_answers: dict[int, str] = {}
     for turn in range(1, max_turns + 1):
         logger.info(f"[turn {turn}] query: {current_query}")
 
@@ -270,7 +283,18 @@ def run_agent_session(
         # 1) retrieve candidates
         retrieval_queries = [current_query]
         if explore_mode and pending_hop_queries:
-            retrieval_queries = _dedupe_queries([current_query] + pending_hop_queries)
+            active_hop_index = min(active_hop_index, max(len(pending_hop_queries) - 1, 0))
+            hop_query = pending_hop_queries[active_hop_index]
+            prev_hop_answer = resolved_hop_answers.get(active_hop_index - 1)
+            if prev_hop_answer:
+                hop_query = f"{hop_query} {prev_hop_answer}"
+            retrieval_queries = _dedupe_queries([hop_query, current_query])
+            logger.info(
+                "sequential hop retrieval active: hop {} / {} (prev_answer={})",
+                active_hop_index + 1,
+                len(pending_hop_queries),
+                bool(prev_hop_answer),
+            )
             logger.info("multi-query retrieval active: {} queries", len(retrieval_queries))
 
         query_candidate_lists: list[list[PageRef]] = []
@@ -505,6 +529,28 @@ def run_agent_session(
             retrieval_traces=retrieval_traces,
         )
         pending_hop_queries = _dedupe_queries(action.get("hop_queries", []))
-        current_query = action["text"] or current_query
+        if pending_hop_queries:
+            active_hop_index = min(active_hop_index, max(len(pending_hop_queries) - 1, 0))
+
+        hop_answer = _normalize_hop_answer(action.get("hop_answer"))
+        if hop_answer and pending_hop_queries:
+            resolved_hop_answers[active_hop_index] = hop_answer
+            logger.info(
+                "captured hop answer for hop {}: {}",
+                active_hop_index + 1,
+                hop_answer,
+            )
+            if active_hop_index < len(pending_hop_queries) - 1:
+                active_hop_index += 1
+                logger.info("advancing to hop {} / {}", active_hop_index + 1, len(pending_hop_queries))
+
+        next_query = action["text"] or current_query
+        if pending_hop_queries:
+            hop_query = pending_hop_queries[active_hop_index]
+            prev_hop_answer = resolved_hop_answers.get(active_hop_index - 1)
+            if prev_hop_answer:
+                hop_query = f"{hop_query} {prev_hop_answer}"
+            next_query = hop_query
+        current_query = next_query
 
     return {"answer": None, "reason": "max_turns", "steps": memory.steps}

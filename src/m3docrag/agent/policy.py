@@ -24,6 +24,8 @@ AGENT_PROMPT = dedent(
        If the question asks for a title/name and a candidate summary explicitly contains that title/name, answer immediately.
     2) For multi-hop questions, prefer decomposing into a single-hop subquestion and respond with CONTINUE HOP.
        You may extract and store intermediate facts from evidence using FACT lines.
+       If hop-2 depends on hop-1, emit one or more HOP_QUERY lines in dependency order.
+       When evidence for the current hop exists, emit HOP_ANSWER with a short value (or UNKNOWN).
        Do not stop after finding only one likely entity if the question still requires a relation/attribute/second clue.
     3) Otherwise, pick the smallest subset of candidate pages that likely advance the answer and say CONTINUE with a refined query if needed.
        Do NOT repeat the same question as CONTINUE QUERY unless you substantially refine it.
@@ -37,6 +39,7 @@ AGENT_PROMPT = dedent(
     Optional additional lines after the first line:
     - FACT: <intermediate fact>
     - HOP_QUERY: <independent subquery for retrieval>
+    - HOP_ANSWER: <short answer for current hop, or UNKNOWN>
     """
 )
 
@@ -280,6 +283,23 @@ def _extract_hop_query_lines(lines: Sequence[str]) -> list[str]:
             if q:
                 queries.append(q)
     return queries
+
+
+def _extract_hop_answer(lines: Sequence[str]) -> Optional[str]:
+    for line in lines:
+        if not isinstance(line, str):
+            continue
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith("hop_answer:"):
+            answer = stripped.split(":", 1)[1].strip()
+            if answer:
+                lower = answer.lower()
+                if lower in {"unknown", "n/a", "none", "not found"}:
+                    return None
+                return answer
+    return None
 
 
 def _dedupe_queries(queries: Sequence[str]) -> list[str]:
@@ -583,7 +603,14 @@ class AgentPolicy:
         raw = llm_call(full_prompt)
         logger.debug(f"LLM raw reply: {raw}")
 
-        action = {"type": "continue", "text": query, "chosen": list(candidates), "facts": [], "hop_queries": []}
+        action = {
+            "type": "continue",
+            "text": query,
+            "chosen": list(candidates),
+            "facts": [],
+            "hop_queries": [],
+            "hop_answer": None,
+        }
 
         if raw is None:
             return action
@@ -594,6 +621,7 @@ class AgentPolicy:
 
         facts = _extract_fact_lines(lines[1:])
         hop_queries = _extract_hop_query_lines(lines[1:])
+        hop_answer = _extract_hop_answer(lines[1:])
         text = lines[0]
         lower = text.lower()
         if lower.startswith("answer:"):
@@ -603,6 +631,7 @@ class AgentPolicy:
                 "chosen": list(candidates),
                 "facts": facts,
                 "hop_queries": [],
+                "hop_answer": None,
             }
         elif lower.startswith("continue query:"):
             refined = text[len("continue query:") :].strip()
@@ -612,6 +641,7 @@ class AgentPolicy:
                 "chosen": list(candidates),
                 "facts": facts,
                 "hop_queries": _dedupe_queries(hop_queries),
+                "hop_answer": hop_answer,
             }
         elif lower.startswith("continue hop:"):
             refined = text[len("continue hop:") :].strip()
@@ -621,6 +651,7 @@ class AgentPolicy:
                 "chosen": list(candidates),
                 "facts": facts,
                 "hop_queries": _dedupe_queries(hop_queries),
+                "hop_answer": hop_answer,
             }
         elif lower.startswith("unanswerable"):
             reason = text.split(":", 1)[-1].strip() if ":" in text else ""
@@ -630,6 +661,7 @@ class AgentPolicy:
                 "chosen": list(candidates),
                 "facts": facts,
                 "hop_queries": [],
+                "hop_answer": None,
             }
 
         prior_continue_hop = bool(memory.steps and memory.steps[-1].action_type == "continue_hop")
@@ -658,6 +690,7 @@ class AgentPolicy:
                 "hop_queries": _suggest_hop_queries(
                     query, list(getattr(memory, "facts", [])) + list(action.get("facts", []))
                 ),
+                "hop_answer": action.get("hop_answer"),
             }
 
         # If the LLM asks to continue but simply repeats a multi-hop question, coerce to an explicit hop query.
@@ -680,6 +713,7 @@ class AgentPolicy:
                     "hop_queries": _suggest_hop_queries(
                         query, list(getattr(memory, "facts", [])) + list(action.get("facts", []))
                     ),
+                    "hop_answer": action.get("hop_answer"),
                 }
 
         if action["type"] == "continue_hop":

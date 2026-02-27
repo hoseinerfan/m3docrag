@@ -157,8 +157,14 @@ def _normalize_policy_output(raw: str, prompt: str) -> str:
         or lower.startswith("continue hop:")
         or lower.startswith("unanswerable")
     ):
-        fact_lines = [ln for ln in lines[1:] if ln.lower().startswith("fact:")]
-        return "\n".join([line] + fact_lines) if fact_lines else line
+        aux_lines = [
+            ln
+            for ln in lines[1:]
+            if ln.lower().startswith("fact:")
+            or ln.lower().startswith("hop_query:")
+            or ln.lower().startswith("hop_answer:")
+        ]
+        return "\n".join([line] + aux_lines) if aux_lines else line
     question = prompt.split("QUESTION:")[-1].strip().split("\n")[0]
     return f"CONTINUE QUERY: {question}"
 
@@ -192,7 +198,9 @@ def make_llm_call_local_hf(model_name_or_path: str, device: str = "cuda"):
         "Return one action line using exactly one format: "
         "ANSWER: <text> OR CONTINUE QUERY: <text> OR CONTINUE HOP: <single-hop subquestion> "
         "OR UNANSWERABLE: <reason>. "
-        "You may optionally add extra lines beginning with 'FACT:' to store intermediate facts."
+        "You may optionally add extra lines beginning with 'FACT:' to store intermediate facts, "
+        "'HOP_QUERY:' to propose independent retrieval subqueries, and "
+        "'HOP_ANSWER:' for the current hop answer (or UNKNOWN)."
     )
 
     if getattr(config, "model_type", "") == "qwen2_vl":
