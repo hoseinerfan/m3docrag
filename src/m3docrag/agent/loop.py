@@ -32,6 +32,47 @@ def _norm_query(text: str) -> str:
     return " ".join((text or "").lower().split())
 
 
+def _slice_rank_window(
+    ranked_ids: Sequence[str],
+    *,
+    start: int,
+    size: int,
+    docid2embs: dict,
+) -> list[str]:
+    if size <= 0:
+        return []
+    if start < 0:
+        start = 0
+    if start >= len(ranked_ids):
+        return []
+    end = min(start + size, len(ranked_ids))
+    return [doc_id for doc_id in ranked_ids[start:end] if doc_id in docid2embs]
+
+
+def _retrieve_rank_window_candidates(
+    *,
+    rag_model: MultimodalRAGModel,
+    query: str,
+    explore_doc_ids: Sequence[str],
+    docid2embs: dict,
+    token2pageuid: Optional[Sequence[str]],
+    all_token_embeddings,
+    n_return_pages: int,
+) -> list[PageRef]:
+    if not explore_doc_ids:
+        return []
+    explore_docid2embs = {doc_id: docid2embs[doc_id] for doc_id in explore_doc_ids}
+    return rag_model.retrieve_pages_from_docs(
+        query=query,
+        docid2embs=explore_docid2embs,
+        index=None,
+        token2pageuid=token2pageuid,
+        all_token_embeddings=all_token_embeddings,
+        n_return_pages=max(n_return_pages, len(explore_doc_ids) * 2),
+        show_progress=False,
+    )
+
+
 def _seen_doc_ids(memory: AgentMemory) -> set[str]:
     seen: set[str] = set()
     for step in memory.steps:
@@ -184,33 +225,56 @@ def run_agent_session(
         if explore_mode and turn > 1 and doc_ranked_ids:
             doc_explore_window = max(explore_span, pages_per_turn * 8)
             window_start = min(doc_explore_window * (turn - 1), len(doc_ranked_ids))
-            window_end = min(window_start + doc_explore_window, len(doc_ranked_ids))
-            if window_end > window_start:
-                explore_doc_ids = [
-                    doc_id
-                    for doc_id in doc_ranked_ids[window_start:window_end]
-                    if doc_id in docid2embs
-                ]
-            else:
-                explore_doc_ids = []
-            if explore_doc_ids:
-                explore_docid2embs = {doc_id: docid2embs[doc_id] for doc_id in explore_doc_ids}
-                explore_candidates = rag_model.retrieve_pages_from_docs(
+            head_explore_doc_ids = _slice_rank_window(
+                doc_ranked_ids,
+                start=window_start,
+                size=doc_explore_window,
+                docid2embs=docid2embs,
+            )
+            if head_explore_doc_ids:
+                explore_candidates = _retrieve_rank_window_candidates(
+                    rag_model=rag_model,
                     query=query,
-                    docid2embs=explore_docid2embs,
-                    index=None,
+                    explore_doc_ids=head_explore_doc_ids,
+                    docid2embs=docid2embs,
                     token2pageuid=token2pageuid,
                     all_token_embeddings=all_token_embeddings,
-                    n_return_pages=max(n_return_pages, len(explore_doc_ids)),
-                    show_progress=False,
+                    n_return_pages=n_return_pages,
                 )
                 candidate_lists.insert(0, explore_candidates)
                 logger.info(
-                    "rank-window exploration active: docs[{}:{}] -> {} docs, {} candidate pages",
+                    "rank-window exploration active (head): docs[{}:{}] -> {} docs, {} candidate pages",
                     window_start,
-                    window_end,
-                    len(explore_doc_ids),
+                    min(window_start + doc_explore_window, len(doc_ranked_ids)),
+                    len(head_explore_doc_ids),
                     len(explore_candidates),
+                )
+
+            tail_end = max(0, len(doc_ranked_ids) - doc_explore_window * (turn - 2))
+            tail_start = max(0, tail_end - doc_explore_window)
+            tail_explore_doc_ids = _slice_rank_window(
+                doc_ranked_ids,
+                start=tail_start,
+                size=tail_end - tail_start,
+                docid2embs=docid2embs,
+            )
+            if tail_explore_doc_ids:
+                tail_candidates = _retrieve_rank_window_candidates(
+                    rag_model=rag_model,
+                    query=query,
+                    explore_doc_ids=tail_explore_doc_ids,
+                    docid2embs=docid2embs,
+                    token2pageuid=token2pageuid,
+                    all_token_embeddings=all_token_embeddings,
+                    n_return_pages=n_return_pages,
+                )
+                candidate_lists.insert(0, tail_candidates)
+                logger.info(
+                    "rank-window exploration active (tail): docs[{}:{}] -> {} docs, {} candidate pages",
+                    tail_start,
+                    tail_end,
+                    len(tail_explore_doc_ids),
+                    len(tail_candidates),
                 )
 
         candidates = _merge_candidate_lists(*candidate_lists)
