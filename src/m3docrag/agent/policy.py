@@ -147,6 +147,17 @@ _FACT_STOPWORDS = {
 }
 
 
+_HOP_QUERY_STOP_PHRASES = {
+    "who",
+    "what",
+    "which",
+    "when",
+    "where",
+    "why",
+    "how",
+}
+
+
 def _normalize_ws(text: str) -> str:
     return " ".join(text.split())
 
@@ -344,12 +355,89 @@ def _has_nontrivial_candidate_evidence(candidate_contexts: Optional[Sequence[Opt
 
 def _suggest_hop_query(query: str, facts: Sequence[str]) -> str:
     q = " ".join((query or "").split())
+    q_lower = q.lower()
+    years = re.findall(r"\b(?:19|20)\d{2}\b", q)
+    year_text = years[0] if years else ""
+    anchor_movie_match = re.search(r"\bwhich\s+(.+?)\s+movie\b", q_lower)
+    anchor_movie = anchor_movie_match.group(1).strip() if anchor_movie_match else ""
+    if anchor_movie:
+        anchor_movie = re.sub(r"[^a-z0-9 ]+", " ", anchor_movie).strip()
+
+    # Prefer a 2+ token title-cased person/entity anchor from the original question.
+    entities = []
+    for m in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b", q):
+        ent = m.group(1).strip()
+        if ent.lower() in _HOP_QUERY_STOP_PHRASES:
+            continue
+        entities.append(ent)
+    person_anchor = entities[0] if entities else ""
+
+    relation_parts = []
+    if "voice actress" in q_lower:
+        relation_parts.append("voice actress")
+    elif "voice actor" in q_lower:
+        relation_parts.append("voice actor")
+    if "dubbed" in q_lower:
+        relation_parts.append("dubbed")
+    if "tamil" in q_lower:
+        relation_parts.append("tamil")
+    if "film" in q_lower:
+        relation_parts.append("film")
+    elif "movie" in q_lower:
+        relation_parts.append("movie")
+    relation_text = " ".join(relation_parts).strip()
+
+    if not facts:
+        parts = [person_anchor, relation_text, year_text]
+        hop = " ".join([p for p in parts if p]).strip()
+        if hop:
+            return hop
+
+    if facts and person_anchor:
+        parts = [anchor_movie, "movie", person_anchor, relation_text, year_text]
+        hop = " ".join([p for p in parts if p]).strip()
+        if hop:
+            return hop
+
     if facts:
         return (
             "Find a different supporting document/page for the missing clue needed to answer: "
             f"{q}"
         )
     return f"Identify one intermediate clue (entity/title/attribute) needed before answering: {q}"
+
+
+def _is_near_duplicate_query(a: str, b: str) -> bool:
+    ta = [t for t in re.findall(r"[a-z0-9]+", (a or "").lower()) if t not in _FACT_STOPWORDS]
+    tb = [t for t in re.findall(r"[a-z0-9]+", (b or "").lower()) if t not in _FACT_STOPWORDS]
+    if not ta or not tb:
+        return _normalize_ws(a).lower() == _normalize_ws(b).lower()
+    sa = set(ta)
+    sb = set(tb)
+    overlap = len(sa & sb) / max(len(sa | sb), 1)
+    return overlap >= 0.8
+
+
+def _is_generic_hop_query(text: str) -> bool:
+    t = _normalize_ws(text).lower()
+    if not t:
+        return False
+    generic_starts = (
+        "who is ",
+        "what is ",
+        "what was ",
+        "which is ",
+        "which was ",
+    )
+    if t.startswith(generic_starts):
+        return True
+    generic_phrases = (
+        "and what is",
+        "and who is",
+        "what is her",
+        "what is his",
+    )
+    return any(p in t for p in generic_phrases)
 
 
 def _should_defer_unanswerable(
@@ -467,9 +555,15 @@ class AgentPolicy:
 
         # If the LLM asks to continue but simply repeats a multi-hop question, coerce to an explicit hop query.
         if action["type"] in ("continue", "continue_hop"):
-            same_query = _normalize_ws(action.get("text", "")) == _normalize_ws(query)
-            if same_query and likely_multihop:
-                hop_query = _suggest_hop_query(query, list(getattr(memory, "facts", [])) + list(action.get("facts", [])))
+            action_text = action.get("text", "")
+            same_query = _normalize_ws(action_text) == _normalize_ws(query)
+            near_duplicate_query = _is_near_duplicate_query(action_text, query)
+            generic_hop_query = _is_generic_hop_query(action_text)
+            if likely_multihop and (same_query or near_duplicate_query or generic_hop_query):
+                hop_query = _suggest_hop_query(
+                    query,
+                    list(getattr(memory, "facts", [])) + list(action.get("facts", [])),
+                )
                 logger.debug(f"Policy repeated continue normalized to CONTINUE HOP for likely multi-hop query: {hop_query}")
                 action = {"type": "continue_hop", "text": hop_query, "chosen": list(candidates), "facts": action.get("facts", [])}
 
