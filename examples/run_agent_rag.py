@@ -347,6 +347,12 @@ def parse_args():
     p.add_argument("--max-turns", type=int, default=4)
     p.add_argument("--pages-per-turn", type=int, default=3)
     p.add_argument("--n-return-pages", type=int, default=6)
+    p.add_argument(
+        "--explore-return-pages-multiplier",
+        type=int,
+        default=10,
+        help="Expansion factor used when hop-mode exploration increases retrieval depth on later turns.",
+    )
     p.add_argument("--device", default="cpu")
     p.add_argument(
         "--context-file",
@@ -419,6 +425,7 @@ def main():
         max_turns=args.max_turns,
         pages_per_turn=args.pages_per_turn,
         n_return_pages=args.n_return_pages,
+        explore_return_pages_multiplier=args.explore_return_pages_multiplier,
         llm_call=llm_call,
         candidate_context_fn=candidate_context_fn,
     )
