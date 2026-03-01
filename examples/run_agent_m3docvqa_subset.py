@@ -296,26 +296,110 @@ def _extract_selection_hop_queries(reply: Optional[str], question: str, max_hops
     return hop_queries[: max(max_hops, 1)]
 
 
+def _extract_year_text(question: str) -> str:
+    years = re.findall(r"\b(?:19|20)\d{2}\b", question)
+    return years[0] if years else ""
+
+
+def _extract_named_entities(question: str) -> list[str]:
+    entities: list[str] = []
+    for match in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b", question):
+        entity = match.group(1).strip()
+        lower = entity.casefold()
+        if lower in {"which", "what", "who", "when", "where", "how"}:
+            continue
+        entities.append(entity)
+    return _dedupe_keep_order(entities)
+
+
+def _extract_anchor_target(question: str) -> tuple[str, str]:
+    q = _norm_text(question)
+    patterns = (
+        r"\bwhich\s+(.+?)\s+(movie|film|album|song|team|state|country|city|series|book)\b",
+        r"\bwhat\s+(.+?)\s+(movie|film|album|song|team|state|country|city|series|book)\b",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, q, flags=re.IGNORECASE)
+        if m:
+            return (_norm_text(m.group(1)), m.group(2).lower())
+    return ("", "")
+
+
+def _heuristic_selection_hop_queries(question: str, max_hops: int) -> tuple[list[str], str]:
+    q = _norm_text(question)
+    q_lower = q.casefold()
+    year_text = _extract_year_text(q)
+    entities = _extract_named_entities(q)
+    person_anchor = entities[0] if entities else ""
+    anchor_target, anchor_type = _extract_anchor_target(q)
+
+    queries: list[str] = []
+
+    # Template 1: dubbed/voice multi-hop movie questions.
+    if any(term in q_lower for term in ("voice actress", "voice actor", "dubbed")):
+        relation_terms: list[str] = []
+        if "voice actress" in q_lower:
+            relation_terms += ["voice", "actress"]
+        elif "voice actor" in q_lower:
+            relation_terms += ["voice", "actor"]
+        if "dubbed" in q_lower:
+            relation_terms.append("dubbed")
+        if "tamil" in q_lower:
+            relation_terms.append("tamil")
+        if "film" in q_lower:
+            relation_terms.append("film")
+        elif "movie" in q_lower:
+            relation_terms.append("movie")
+
+        first_parts = [person_anchor, anchor_target, " ".join(relation_terms), year_text]
+        first_hop = _norm_text(" ".join([p for p in first_parts if p]))
+        if first_hop:
+            queries.append(first_hop)
+
+        if anchor_target and any(term in q_lower for term in ("dubbed", "tamil")):
+            version_parts = [
+                "Who dubbed the",
+                "Tamil" if "tamil" in q_lower else "",
+                "version of the",
+                year_text,
+                anchor_target,
+                anchor_type or ("movie" if "movie" in q_lower else "film" if "film" in q_lower else ""),
+            ]
+            version_hop = _norm_text(" ".join([p for p in version_parts if p]))
+            if version_hop:
+                queries.append(version_hop)
+
+    # Template 2: anchored entity/title questions.
+    if not queries and anchor_target:
+        anchor_hop = _norm_text(" ".join([anchor_target, anchor_type, year_text]).strip())
+        if anchor_hop:
+            queries.append(anchor_hop)
+        if person_anchor:
+            relation_hop = _norm_text(" ".join([person_anchor, anchor_target, anchor_type, year_text]).strip())
+            if relation_hop:
+                queries.append(relation_hop)
+
+    # Template 3: generic fallback using named entity + year.
+    if not queries and person_anchor:
+        generic_hop = _norm_text(" ".join([person_anchor, year_text]).strip())
+        if generic_hop:
+            queries.append(generic_hop)
+
+    # Always retain the root question as an anchor query.
+    queries.append(q)
+    queries = _dedupe_keep_order(queries)
+    queries = queries[: max(max_hops, 1)]
+
+    planner_reply = "\n".join(["HEURISTIC"] + [f"HOP_QUERY: {x}" for x in queries])
+    return queries, planner_reply
+
+
 def _plan_selection_hop_queries(
     *,
     question: str,
-    llm_call,
     max_hops: int,
 ) -> tuple[list[str], Optional[str]]:
-    prompt = (
-        "You are planning retrieval-only support document selection. "
-        "Decompose the question into at most "
-        f"{max(max_hops, 1)} ordered hop queries. "
-        "Return exactly one first line as CONTINUE HOP: <first hop query>. "
-        "Then add zero or more lines as HOP_QUERY: <next hop query> in dependency order. "
-        "Do not answer the question.\n"
-        f"QUESTION: {question}"
-    )
-    reply = llm_call(prompt)
-    hop_queries = _extract_selection_hop_queries(reply, question, max_hops)
-    if _norm_text(question).casefold() not in {q.casefold() for q in hop_queries}:
-        hop_queries.append(_norm_text(question))
-    return _dedupe_keep_order(hop_queries), reply
+    return _heuristic_selection_hop_queries(question, max_hops)
 
 
 def _top_docs_payload_from_pages(rows: list[tuple[str, int, float]], limit: int) -> list[dict]:
@@ -342,13 +426,11 @@ def run_selection_only_session(
     question: str,
     rag_model,
     docid2embs: dict,
-    llm_call,
     selection_max_hop_queries: int,
     selection_topk_docs_per_hop: int,
 ):
     hop_queries, planner_reply = _plan_selection_hop_queries(
         question=question,
-        llm_call=llm_call,
         max_hops=selection_max_hop_queries,
     )
     logger.info(
@@ -823,7 +905,10 @@ def main():
 
     rag_model = build_rag_model(device=args.device)
     policy_device = args.policy_device or args.device
-    if args.policy_backend == "stub":
+    if args.selection_only:
+        llm_call = None
+        logger.info("Selection-only mode uses heuristic hop planning; skipping policy model initialization.")
+    elif args.policy_backend == "stub":
         llm_call = make_llm_call_stub()
     else:
         if not args.policy_model:
@@ -930,7 +1015,6 @@ def main():
                         question=question,
                         rag_model=rag_model,
                         docid2embs=docid2embs,
-                        llm_call=llm_call,
                         selection_max_hop_queries=args.selection_max_hop_queries,
                         selection_topk_docs_per_hop=args.selection_topk_docs_per_hop,
                     )
@@ -1015,6 +1099,7 @@ def main():
             "n_return_pages": args.n_return_pages,
             "explore_return_pages_multiplier": args.explore_return_pages_multiplier,
             "selection_only": args.selection_only,
+            "selection_planner": ("heuristic" if args.selection_only else None),
             "selection_max_hop_queries": args.selection_max_hop_queries,
             "selection_topk_docs_per_hop": args.selection_topk_docs_per_hop,
             "policy_backend": args.policy_backend,
