@@ -144,6 +144,23 @@ def parse_args():
         action="store_true",
         help="Clear cached embeddings/page contexts after each example to reduce memory growth on long runs.",
     )
+    p.add_argument(
+        "--selection-only",
+        action="store_true",
+        help="Run a lightweight selection-only mode: one hop-planning call plus per-hop doc retrieval, without page-context extraction or iterative answer generation.",
+    )
+    p.add_argument(
+        "--selection-max-hop-queries",
+        type=int,
+        default=3,
+        help="Max hop queries to keep from the planner in --selection-only mode.",
+    )
+    p.add_argument(
+        "--selection-topk-docs-per-hop",
+        type=int,
+        default=2,
+        help="Max unique docs selected from each hop query in --selection-only mode.",
+    )
     p.add_argument("--stop-on-error", action="store_true")
     return p.parse_args()
 
@@ -239,6 +256,172 @@ def _norm_answer(text: Optional[str]) -> Optional[str]:
     text = text.casefold()
     text = " ".join(text.split())
     return text or None
+
+
+def _norm_text(text: Optional[str]) -> str:
+    return " ".join((text or "").split())
+
+
+def _dedupe_keep_order(items: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        val = _norm_text(item)
+        if not val:
+            continue
+        key = val.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(val)
+    return out
+
+
+def _extract_selection_hop_queries(reply: Optional[str], question: str, max_hops: int) -> list[str]:
+    lines = [ln.strip() for ln in (reply or "").splitlines() if ln.strip()]
+    hop_queries: list[str] = []
+    if lines:
+        first = lines[0]
+        lower = first.lower()
+        if lower.startswith("continue hop:"):
+            hop_queries.append(first.split(":", 1)[1].strip())
+        elif lower.startswith("continue query:"):
+            hop_queries.append(first.split(":", 1)[1].strip())
+        for line in lines[1:]:
+            if line.lower().startswith("hop_query:"):
+                hop_queries.append(line.split(":", 1)[1].strip())
+    hop_queries = _dedupe_keep_order(hop_queries)
+    if not hop_queries:
+        hop_queries = [_norm_text(question)]
+    return hop_queries[: max(max_hops, 1)]
+
+
+def _plan_selection_hop_queries(
+    *,
+    question: str,
+    llm_call,
+    max_hops: int,
+) -> tuple[list[str], Optional[str]]:
+    prompt = (
+        "You are planning retrieval-only support document selection. "
+        "Decompose the question into at most "
+        f"{max(max_hops, 1)} ordered hop queries. "
+        "Return exactly one first line as CONTINUE HOP: <first hop query>. "
+        "Then add zero or more lines as HOP_QUERY: <next hop query> in dependency order. "
+        "Do not answer the question.\n"
+        f"QUESTION: {question}"
+    )
+    reply = llm_call(prompt)
+    hop_queries = _extract_selection_hop_queries(reply, question, max_hops)
+    if _norm_text(question).casefold() not in {q.casefold() for q in hop_queries}:
+        hop_queries.append(_norm_text(question))
+    return _dedupe_keep_order(hop_queries), reply
+
+
+def _top_docs_payload_from_pages(rows: list[tuple[str, int, float]], limit: int) -> list[dict]:
+    out: list[dict] = []
+    seen: set[str] = set()
+    for doc_id, page_idx, score in rows:
+        if doc_id in seen:
+            continue
+        seen.add(doc_id)
+        out.append(
+            {
+                "doc_id": str(doc_id),
+                "best_page_idx": int(page_idx),
+                "best_page_score": float(score),
+            }
+        )
+        if len(out) >= limit:
+            break
+    return out
+
+
+def run_selection_only_session(
+    *,
+    question: str,
+    rag_model,
+    docid2embs: dict,
+    llm_call,
+    selection_max_hop_queries: int,
+    selection_topk_docs_per_hop: int,
+):
+    hop_queries, planner_reply = _plan_selection_hop_queries(
+        question=question,
+        llm_call=llm_call,
+        max_hops=selection_max_hop_queries,
+    )
+    logger.info(
+        "selection-only plan: {} queries | {}",
+        len(hop_queries),
+        hop_queries,
+    )
+
+    steps = []
+    selected_doc_ids: set[str] = set()
+
+    for turn, hop_query in enumerate(hop_queries, start=1):
+        retrieved = rag_model.retrieve_pages_from_docs(
+            query=hop_query,
+            docid2embs=docid2embs,
+            index=None,
+            token2pageuid=None,
+            all_token_embeddings=None,
+            n_return_pages=max(selection_topk_docs_per_hop, 1),
+            single_page_from_each_doc=True,
+            show_progress=False,
+        )
+
+        top_docs = _top_docs_payload_from_pages(
+            retrieved,
+            limit=max(selection_topk_docs_per_hop * 4, selection_topk_docs_per_hop),
+        )
+        selected_pages = []
+        for doc_id, page_idx, score in retrieved:
+            if doc_id in selected_doc_ids:
+                continue
+            selected_doc_ids.add(doc_id)
+            selected_pages.append((str(doc_id), int(page_idx), float(score)))
+            if len(selected_pages) >= selection_topk_docs_per_hop:
+                break
+
+        steps.append(
+            {
+                "turn": turn,
+                "query": hop_query,
+                "selected_pages": selected_pages,
+                "answer": None,
+                "stop_reason": None,
+                "action_type": "selection_only",
+                "facts_added": [],
+                "retrieval_traces": [
+                    {
+                        "query": hop_query,
+                        "returned_page_count": len(retrieved),
+                        "top_pages": [
+                            {
+                                "doc_id": str(doc_id),
+                                "page_idx": int(page_idx),
+                                "score": float(score),
+                            }
+                            for doc_id, page_idx, score in retrieved[: max(selection_topk_docs_per_hop * 4, 4)]
+                        ],
+                        "top_docs": top_docs,
+                    }
+                ],
+            }
+        )
+
+    return {
+        "answer": None,
+        "reason": "selection_only",
+        "steps": steps,
+        "selection_plan": {
+            "planner_reply": planner_reply,
+            "hop_queries": hop_queries,
+            "topk_docs_per_hop": selection_topk_docs_per_hop,
+        },
+    }
 
 
 def _pick_column(
@@ -738,28 +921,38 @@ def main():
                 for doc_id in doc_pool_ids:
                     embs = cache.get_doc_embeddings(doc_id)
                     docid2embs_cpu[doc_id] = embs
-                    merged_context_map.update(cache.get_doc_context_map(doc_id))
+                    if not args.selection_only:
+                        merged_context_map.update(cache.get_doc_context_map(doc_id))
 
-                candidate_context_fn = make_candidate_context_fn(
-                    merged_context_map,
-                    max_chars=args.context_max_chars,
-                )
                 docid2embs = move_doc_embs(docid2embs_cpu, args.device)
-
-                result = run_agent_session(
-                    query=question,
-                    rag_model=rag_model,
-                    docid2embs=docid2embs,
-                    doc_ranked_ids=doc_pool_ids,
-                    token2pageuid=None,
-                    all_token_embeddings=None,
-                    max_turns=args.max_turns,
-                    pages_per_turn=args.pages_per_turn,
-                    n_return_pages=args.n_return_pages,
-                    explore_return_pages_multiplier=args.explore_return_pages_multiplier,
-                    llm_call=llm_call,
-                    candidate_context_fn=candidate_context_fn,
-                )
+                if args.selection_only:
+                    result = run_selection_only_session(
+                        question=question,
+                        rag_model=rag_model,
+                        docid2embs=docid2embs,
+                        llm_call=llm_call,
+                        selection_max_hop_queries=args.selection_max_hop_queries,
+                        selection_topk_docs_per_hop=args.selection_topk_docs_per_hop,
+                    )
+                else:
+                    candidate_context_fn = make_candidate_context_fn(
+                        merged_context_map,
+                        max_chars=args.context_max_chars,
+                    )
+                    result = run_agent_session(
+                        query=question,
+                        rag_model=rag_model,
+                        docid2embs=docid2embs,
+                        doc_ranked_ids=doc_pool_ids,
+                        token2pageuid=None,
+                        all_token_embeddings=None,
+                        max_turns=args.max_turns,
+                        pages_per_turn=args.pages_per_turn,
+                        n_return_pages=args.n_return_pages,
+                        explore_return_pages_multiplier=args.explore_return_pages_multiplier,
+                        llm_call=llm_call,
+                        candidate_context_fn=candidate_context_fn,
+                    )
 
                 payload = to_jsonable(result)
                 reason = payload.get("reason")
@@ -821,6 +1014,9 @@ def main():
             "pages_per_turn": args.pages_per_turn,
             "n_return_pages": args.n_return_pages,
             "explore_return_pages_multiplier": args.explore_return_pages_multiplier,
+            "selection_only": args.selection_only,
+            "selection_max_hop_queries": args.selection_max_hop_queries,
+            "selection_topk_docs_per_hop": args.selection_topk_docs_per_hop,
             "policy_backend": args.policy_backend,
             "policy_model": args.policy_model,
             "policy_device": policy_device,
