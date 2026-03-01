@@ -326,7 +326,7 @@ def _extract_anchor_target(question: str) -> tuple[str, str]:
     return ("", "")
 
 
-def _heuristic_selection_hop_queries(question: str, max_hops: int) -> tuple[list[str], str]:
+def _heuristic_selection_hop_queries(question: str, max_queries: int) -> list[str]:
     q = _norm_text(question)
     q_lower = q.casefold()
     year_text = _extract_year_text(q)
@@ -386,13 +386,8 @@ def _heuristic_selection_hop_queries(question: str, max_hops: int) -> tuple[list
         if generic_hop:
             queries.append(generic_hop)
 
-    # Always retain the root question as an anchor query.
-    queries.append(q)
     queries = _dedupe_keep_order(queries)
-    queries = queries[: max(max_hops, 1)]
-
-    planner_reply = "\n".join(["HEURISTIC"] + [f"HOP_QUERY: {x}" for x in queries])
-    return queries, planner_reply
+    return queries[: max(max_queries, 0)]
 
 
 def _plan_selection_hop_queries(
@@ -400,7 +395,20 @@ def _plan_selection_hop_queries(
     question: str,
     max_hops: int,
 ) -> tuple[list[str], Optional[str]]:
-    return _heuristic_selection_hop_queries(question, max_hops)
+    root_query = _norm_text(question)
+    if max_hops <= 1:
+        queries = [root_query]
+    else:
+        aux_queries = _heuristic_selection_hop_queries(question, max_hops + 2)
+        aux_queries = [q for q in aux_queries if q.casefold() != root_query.casefold()]
+        queries = [root_query] + aux_queries[: max_hops - 1]
+    planner_reply = "\n".join(["HEURISTIC"] + [f"HOP_QUERY: {x}" for x in queries])
+    return queries, planner_reply
+
+
+def _selection_only_retrieval_depth(selection_topk_docs_per_hop: int) -> int:
+    quota = max(selection_topk_docs_per_hop, 1)
+    return max(quota * 8, 8)
 
 
 def _top_docs_payload_from_pages(rows: list[tuple[str, int, float]], limit: int) -> list[dict]:
@@ -442,6 +450,7 @@ def run_selection_only_session(
 
     steps = []
     selected_doc_ids: set[str] = set()
+    retrieval_depth = _selection_only_retrieval_depth(selection_topk_docs_per_hop)
 
     for turn, hop_query in enumerate(hop_queries, start=1):
         retrieved = rag_model.retrieve_pages_from_docs(
@@ -450,7 +459,7 @@ def run_selection_only_session(
             index=None,
             token2pageuid=None,
             all_token_embeddings=None,
-            n_return_pages=max(selection_topk_docs_per_hop, 1),
+            n_return_pages=retrieval_depth,
             single_page_from_each_doc=True,
             show_progress=False,
         )
@@ -499,11 +508,12 @@ def run_selection_only_session(
         "answer": None,
         "reason": "selection_only",
         "steps": steps,
-        "selection_plan": {
-            "planner_reply": planner_reply,
-            "hop_queries": hop_queries,
-            "topk_docs_per_hop": selection_topk_docs_per_hop,
-        },
+            "selection_plan": {
+                "planner_reply": planner_reply,
+                "hop_queries": hop_queries,
+                "topk_docs_per_hop": selection_topk_docs_per_hop,
+                "retrieval_depth_per_query": retrieval_depth,
+            },
     }
 
 
