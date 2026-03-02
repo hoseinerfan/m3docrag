@@ -327,6 +327,44 @@ def _extract_anchor_target(question: str) -> tuple[str, str]:
 
 
 def _extract_comparison_option_queries(question: str) -> list[str]:
+    def _descriptor_option_query(option_text: str) -> str:
+        option_norm = _norm_text(option_text)
+        option_lower = option_norm.casefold()
+        if not any(
+            marker in option_lower
+            for marker in ("logo", "poster", "cover", "flag", "pictured", "featuring", "features", "showing", "depicting")
+        ):
+            return option_norm
+
+        anchor_nouns = {"college", "movie", "film", "album", "song", "team", "country", "state", "city", "book"}
+        stopwords = {
+            "the",
+            "a",
+            "an",
+            "with",
+            "whose",
+            "its",
+            "their",
+            "his",
+            "her",
+            "on",
+            "in",
+            "of",
+            "for",
+            "that",
+            "featuring",
+            "features",
+            "showing",
+            "depicting",
+            "pictured",
+        }
+        tokens = re.findall(r"[A-Za-z0-9']+", option_norm)
+        kept = [tok for tok in tokens if tok.casefold() not in stopwords]
+        descriptor_tokens = [tok for tok in kept if tok.casefold() not in anchor_nouns]
+        anchor_tokens = [tok for tok in kept if tok.casefold() in anchor_nouns]
+        compact = _norm_text(" ".join(descriptor_tokens + anchor_tokens))
+        return compact or option_norm
+
     q = _norm_text(question)
     # Prefer the explicit comparison tail after the final colon:
     # "Which ...: Option A or Option B?"
@@ -350,8 +388,8 @@ def _extract_comparison_option_queries(question: str) -> list[str]:
 
         compact_context = " ".join(_dedupe_keep_order(context_parts))
         option_queries = [
-            _norm_text(" ".join([option_a, compact_context])),
-            _norm_text(" ".join([option_b, compact_context])),
+            _norm_text(" ".join([_descriptor_option_query(option_a), compact_context])),
+            _norm_text(" ".join([_descriptor_option_query(option_b), compact_context])),
         ]
         return _dedupe_keep_order(option_queries)
     return []
