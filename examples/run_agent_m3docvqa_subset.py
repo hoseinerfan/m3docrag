@@ -335,12 +335,25 @@ def _extract_comparison_option_queries(question: str) -> list[str]:
         prefix = _norm_text(m.group("prefix"))
         option_a = _norm_text(m.group("a").strip(" ,"))
         option_b = _norm_text(m.group("b").strip(" ,"))
-        return _dedupe_keep_order(
-            [
-                _norm_text(f"{prefix}: {option_a}"),
-                _norm_text(f"{prefix}: {option_b}"),
-            ]
-        )
+        prefix_lower = prefix.casefold()
+        year_text = _extract_year_text(prefix)
+
+        context_parts: list[str] = []
+        for phrase in ("NFL Draft", "NBA Draft", "Miami Dolphins", "Seattle Dragons"):
+            if phrase.casefold() in prefix_lower:
+                context_parts.append(phrase)
+        for noun in ("college", "movie", "film", "album", "song", "team", "season", "draft"):
+            if noun in prefix_lower:
+                context_parts.append(noun)
+        if year_text:
+            context_parts.append(year_text)
+
+        compact_context = " ".join(_dedupe_keep_order(context_parts))
+        option_queries = [
+            _norm_text(" ".join([option_a, compact_context])),
+            _norm_text(" ".join([option_b, compact_context])),
+        ]
+        return _dedupe_keep_order(option_queries)
     return []
 
 
