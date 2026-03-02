@@ -327,14 +327,15 @@ def _extract_anchor_target(question: str) -> tuple[str, str]:
 
 
 def _extract_comparison_option_queries(question: str) -> list[str]:
-    def _descriptor_option_query(option_text: str) -> str:
+    def _descriptor_option_query(option_text: str) -> tuple[str, bool]:
         option_norm = _norm_text(option_text)
         option_lower = option_norm.casefold()
-        if not any(
+        is_descriptor = any(
             marker in option_lower
             for marker in ("logo", "poster", "cover", "flag", "pictured", "featuring", "features", "showing", "depicting")
-        ):
-            return option_norm
+        )
+        if not is_descriptor:
+            return option_norm, False
 
         anchor_nouns = {"college", "movie", "film", "album", "song", "team", "country", "state", "city", "book"}
         stopwords = {
@@ -363,7 +364,7 @@ def _extract_comparison_option_queries(question: str) -> list[str]:
         descriptor_tokens = [tok for tok in kept if tok.casefold() not in anchor_nouns]
         anchor_tokens = [tok for tok in kept if tok.casefold() in anchor_nouns]
         compact = _norm_text(" ".join(descriptor_tokens + anchor_tokens))
-        return compact or option_norm
+        return compact or option_norm, True
 
     q = _norm_text(question)
     # Prefer the explicit comparison tail after the final colon:
@@ -387,9 +388,19 @@ def _extract_comparison_option_queries(question: str) -> list[str]:
             context_parts.append(year_text)
 
         compact_context = " ".join(_dedupe_keep_order(context_parts))
+        option_a_query, option_a_is_descriptor = _descriptor_option_query(option_a)
+        option_b_query, option_b_is_descriptor = _descriptor_option_query(option_b)
         option_queries = [
-            _norm_text(" ".join([_descriptor_option_query(option_a), compact_context])),
-            _norm_text(" ".join([_descriptor_option_query(option_b), compact_context])),
+            (
+                option_a_query
+                if option_a_is_descriptor
+                else _norm_text(" ".join([option_a_query, compact_context]))
+            ),
+            (
+                option_b_query
+                if option_b_is_descriptor
+                else _norm_text(" ".join([option_b_query, compact_context]))
+            ),
         ]
         return _dedupe_keep_order(option_queries)
     return []
