@@ -326,6 +326,24 @@ def _extract_anchor_target(question: str) -> tuple[str, str]:
     return ("", "")
 
 
+def _extract_comparison_option_queries(question: str) -> list[str]:
+    q = _norm_text(question)
+    # Prefer the explicit comparison tail after the final colon:
+    # "Which ...: Option A or Option B?"
+    m = re.search(r"^(?P<prefix>.+?):\s*(?P<a>.+?)\s+or\s+(?P<b>.+?)\??$", q, flags=re.IGNORECASE)
+    if m:
+        prefix = _norm_text(m.group("prefix"))
+        option_a = _norm_text(m.group("a").strip(" ,"))
+        option_b = _norm_text(m.group("b").strip(" ,"))
+        return _dedupe_keep_order(
+            [
+                _norm_text(f"{prefix}: {option_a}"),
+                _norm_text(f"{prefix}: {option_b}"),
+            ]
+        )
+    return []
+
+
 def _heuristic_selection_hop_queries(question: str, max_queries: int) -> list[str]:
     q = _norm_text(question)
     q_lower = q.casefold()
@@ -396,13 +414,20 @@ def _plan_selection_hop_queries(
     max_hops: int,
 ) -> tuple[list[str], Optional[str]]:
     root_query = _norm_text(question)
+    comparison_queries = _extract_comparison_option_queries(question)
     if max_hops <= 1:
         queries = [root_query]
+        planner_kind = "HEURISTIC"
+    elif comparison_queries:
+        # For "X or Y" comparisons, always keep both option-specific tracks plus the root query.
+        queries = [root_query] + comparison_queries[:2]
+        planner_kind = "HEURISTIC_COMPARISON"
     else:
         aux_queries = _heuristic_selection_hop_queries(question, max_hops + 2)
         aux_queries = [q for q in aux_queries if q.casefold() != root_query.casefold()]
         queries = [root_query] + aux_queries[: max_hops - 1]
-    planner_reply = "\n".join(["HEURISTIC"] + [f"HOP_QUERY: {x}" for x in queries])
+        planner_kind = "HEURISTIC"
+    planner_reply = "\n".join([planner_kind] + [f"HOP_QUERY: {x}" for x in queries])
     return queries, planner_reply
 
 
