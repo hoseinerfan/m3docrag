@@ -501,13 +501,16 @@ def _selection_only_retrieval_depth(selection_topk_docs_per_hop: int) -> int:
 def _top_docs_payload_from_pages(rows: list[tuple[str, int, float]], limit: int) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
+    rank = 0
     for doc_id, page_idx, score in rows:
         if doc_id in seen:
             continue
         seen.add(doc_id)
+        rank += 1
         out.append(
             {
                 "doc_id": str(doc_id),
+                "returned_rank": rank,
                 "best_page_idx": int(page_idx),
                 "best_page_score": float(score),
             }
@@ -553,7 +556,7 @@ def run_selection_only_session(
 
         top_docs = _top_docs_payload_from_pages(
             retrieved,
-            limit=max(selection_topk_docs_per_hop * 4, selection_topk_docs_per_hop),
+            limit=retrieval_depth,
         )
         selected_pages = []
         for doc_id, page_idx, score in retrieved:
@@ -583,7 +586,7 @@ def run_selection_only_session(
                                 "page_idx": int(page_idx),
                                 "score": float(score),
                             }
-                            for doc_id, page_idx, score in retrieved[: max(selection_topk_docs_per_hop * 4, 4)]
+                            for doc_id, page_idx, score in retrieved[:retrieval_depth]
                         ],
                         "top_docs": top_docs,
                     }
