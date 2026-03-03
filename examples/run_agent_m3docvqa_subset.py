@@ -512,6 +512,50 @@ def _is_descriptor_focused_query(query: str) -> bool:
     return any(marker in q for marker in ("logo", "poster", "cover", "flag"))
 
 
+def _select_selection_only_pages(
+    *,
+    retrieved: list[tuple[str, int, float]],
+    selected_doc_ids: set[str],
+    quota: int,
+    descriptor_focused: bool,
+) -> list[tuple[str, int, float]]:
+    if quota <= 0:
+        return []
+
+    available = [(str(doc_id), int(page_idx), float(score)) for doc_id, page_idx, score in retrieved if doc_id not in selected_doc_ids]
+    if not available:
+        return []
+
+    picked: list[tuple[str, int, float]] = []
+    picked_doc_ids: set[str] = set()
+
+    def add_candidate(candidate: tuple[str, int, float]) -> bool:
+        doc_id = candidate[0]
+        if doc_id in selected_doc_ids or doc_id in picked_doc_ids:
+            return False
+        picked.append(candidate)
+        picked_doc_ids.add(doc_id)
+        return True
+
+    if descriptor_focused:
+        add_candidate(available[0])
+        if quota > 1:
+            deeper_band = available[8:24]
+            if not deeper_band:
+                deeper_band = available[4:]
+            for candidate in deeper_band:
+                if add_candidate(candidate):
+                    break
+
+    for candidate in available:
+        if len(picked) >= quota:
+            break
+        add_candidate(candidate)
+
+    selected_doc_ids.update(doc_id for doc_id, _, _ in picked)
+    return picked
+
+
 def _top_docs_payload_from_pages(rows: list[tuple[str, int, float]], limit: int) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
@@ -557,9 +601,10 @@ def run_selection_only_session(
     base_retrieval_depth = _selection_only_retrieval_depth(selection_topk_docs_per_hop)
 
     for turn, hop_query in enumerate(hop_queries, start=1):
+        descriptor_focused = _is_descriptor_focused_query(hop_query)
         query_retrieval_depth = (
             max(base_retrieval_depth * 4, 64)
-            if _is_descriptor_focused_query(hop_query)
+            if descriptor_focused
             else base_retrieval_depth
         )
         retrieved = rag_model.retrieve_pages_from_docs(
@@ -577,14 +622,12 @@ def run_selection_only_session(
             retrieved,
             limit=query_retrieval_depth,
         )
-        selected_pages = []
-        for doc_id, page_idx, score in retrieved:
-            if doc_id in selected_doc_ids:
-                continue
-            selected_doc_ids.add(doc_id)
-            selected_pages.append((str(doc_id), int(page_idx), float(score)))
-            if len(selected_pages) >= selection_topk_docs_per_hop:
-                break
+        selected_pages = _select_selection_only_pages(
+            retrieved=retrieved,
+            selected_doc_ids=selected_doc_ids,
+            quota=selection_topk_docs_per_hop,
+            descriptor_focused=descriptor_focused,
+        )
 
         steps.append(
             {
