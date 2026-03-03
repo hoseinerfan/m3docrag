@@ -522,32 +522,36 @@ def _select_selection_only_pages(
     if quota <= 0:
         return []
 
-    available = [(str(doc_id), int(page_idx), float(score)) for doc_id, page_idx, score in retrieved if doc_id not in selected_doc_ids]
-    if not available:
+    ranked_available = [
+        (rank, str(doc_id), int(page_idx), float(score))
+        for rank, (doc_id, page_idx, score) in enumerate(retrieved, start=1)
+        if doc_id not in selected_doc_ids
+    ]
+    if not ranked_available:
         return []
 
     picked: list[tuple[str, int, float]] = []
     picked_doc_ids: set[str] = set()
 
-    def add_candidate(candidate: tuple[str, int, float]) -> bool:
-        doc_id = candidate[0]
+    def add_candidate(candidate: tuple[int, str, int, float]) -> bool:
+        _, doc_id, page_idx, score = candidate
         if doc_id in selected_doc_ids or doc_id in picked_doc_ids:
             return False
-        picked.append(candidate)
+        picked.append((doc_id, page_idx, score))
         picked_doc_ids.add(doc_id)
         return True
 
     if descriptor_focused:
-        add_candidate(available[0])
+        add_candidate(ranked_available[0])
         if quota > 1:
-            deeper_band = available[8:24]
+            deeper_band = [candidate for candidate in ranked_available if 9 <= candidate[0] <= 24]
             if not deeper_band:
-                deeper_band = available[4:]
-            for candidate in deeper_band:
-                if add_candidate(candidate):
-                    break
+                deeper_band = [candidate for candidate in ranked_available if candidate[0] >= 5]
+            if deeper_band:
+                target_band_rank = 13
+                add_candidate(min(deeper_band, key=lambda candidate: abs(candidate[0] - target_band_rank)))
 
-    for candidate in available:
+    for candidate in ranked_available:
         if len(picked) >= quota:
             break
         add_candidate(candidate)
