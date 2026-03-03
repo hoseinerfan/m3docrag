@@ -327,7 +327,7 @@ def _extract_anchor_target(question: str) -> tuple[str, str]:
 
 
 def _extract_comparison_option_queries(question: str) -> list[str]:
-    def _descriptor_option_query(option_text: str) -> tuple[str, bool]:
+    def _descriptor_option_queries(option_text: str) -> tuple[list[str], bool]:
         option_norm = _norm_text(option_text)
         option_lower = option_norm.casefold()
         is_descriptor = any(
@@ -335,7 +335,7 @@ def _extract_comparison_option_queries(question: str) -> list[str]:
             for marker in ("logo", "poster", "cover", "flag", "pictured", "featuring", "features", "showing", "depicting")
         )
         if not is_descriptor:
-            return option_norm, False
+            return [option_norm], False
 
         anchor_nouns = {"college", "movie", "film", "album", "song", "team", "country", "state", "city", "book"}
         stopwords = {
@@ -363,8 +363,13 @@ def _extract_comparison_option_queries(question: str) -> list[str]:
         kept = [tok for tok in tokens if tok.casefold() not in stopwords]
         descriptor_tokens = [tok for tok in kept if tok.casefold() not in anchor_nouns]
         anchor_tokens = [tok for tok in kept if tok.casefold() in anchor_nouns]
-        compact = _norm_text(" ".join(descriptor_tokens + anchor_tokens))
-        return compact or option_norm, True
+        variants = _dedupe_keep_order(
+            [
+                _norm_text(" ".join(descriptor_tokens + anchor_tokens)),
+                _norm_text(" ".join(anchor_tokens + descriptor_tokens)),
+            ]
+        )
+        return variants or [option_norm], True
 
     q = _norm_text(question)
     # Prefer the explicit comparison tail after the final colon:
@@ -388,20 +393,21 @@ def _extract_comparison_option_queries(question: str) -> list[str]:
             context_parts.append(year_text)
 
         compact_context = " ".join(_dedupe_keep_order(context_parts))
-        option_a_query, option_a_is_descriptor = _descriptor_option_query(option_a)
-        option_b_query, option_b_is_descriptor = _descriptor_option_query(option_b)
-        option_queries = [
-            (
-                option_a_query
+        option_a_queries, option_a_is_descriptor = _descriptor_option_queries(option_a)
+        option_b_queries, option_b_is_descriptor = _descriptor_option_queries(option_b)
+        option_queries: list[str] = []
+        for query_text in option_a_queries:
+            option_queries.append(
+                query_text
                 if option_a_is_descriptor
-                else _norm_text(" ".join([option_a_query, compact_context]))
-            ),
-            (
-                option_b_query
+                else _norm_text(" ".join([query_text, compact_context]))
+            )
+        for query_text in option_b_queries:
+            option_queries.append(
+                query_text
                 if option_b_is_descriptor
-                else _norm_text(" ".join([option_b_query, compact_context]))
-            ),
-        ]
+                else _norm_text(" ".join([query_text, compact_context]))
+            )
         return _dedupe_keep_order(option_queries)
     return []
 
@@ -482,7 +488,7 @@ def _plan_selection_hop_queries(
         planner_kind = "HEURISTIC"
     elif comparison_queries:
         # For "X or Y" comparisons, always keep both option-specific tracks plus the root query.
-        queries = [root_query] + comparison_queries[:2]
+        queries = [root_query] + comparison_queries
         planner_kind = "HEURISTIC_COMPARISON"
     else:
         aux_queries = _heuristic_selection_hop_queries(question, max_hops + 2)
@@ -496,6 +502,14 @@ def _plan_selection_hop_queries(
 def _selection_only_retrieval_depth(selection_topk_docs_per_hop: int) -> int:
     quota = max(selection_topk_docs_per_hop, 1)
     return max(quota * 8, 8)
+
+
+def _is_descriptor_focused_query(query: str) -> bool:
+    q = _norm_text(query).casefold()
+    tokens = re.findall(r"[A-Za-z0-9']+", q)
+    if len(tokens) > 8:
+        return False
+    return any(marker in q for marker in ("logo", "poster", "cover", "flag"))
 
 
 def _top_docs_payload_from_pages(rows: list[tuple[str, int, float]], limit: int) -> list[dict]:
@@ -540,23 +554,28 @@ def run_selection_only_session(
 
     steps = []
     selected_doc_ids: set[str] = set()
-    retrieval_depth = _selection_only_retrieval_depth(selection_topk_docs_per_hop)
+    base_retrieval_depth = _selection_only_retrieval_depth(selection_topk_docs_per_hop)
 
     for turn, hop_query in enumerate(hop_queries, start=1):
+        query_retrieval_depth = (
+            max(base_retrieval_depth * 4, 64)
+            if _is_descriptor_focused_query(hop_query)
+            else base_retrieval_depth
+        )
         retrieved = rag_model.retrieve_pages_from_docs(
             query=hop_query,
             docid2embs=docid2embs,
             index=None,
             token2pageuid=None,
             all_token_embeddings=None,
-            n_return_pages=retrieval_depth,
+            n_return_pages=query_retrieval_depth,
             single_page_from_each_doc=True,
             show_progress=False,
         )
 
         top_docs = _top_docs_payload_from_pages(
             retrieved,
-            limit=retrieval_depth,
+            limit=query_retrieval_depth,
         )
         selected_pages = []
         for doc_id, page_idx, score in retrieved:
@@ -579,6 +598,7 @@ def run_selection_only_session(
                 "retrieval_traces": [
                     {
                         "query": hop_query,
+                        "requested_page_count": query_retrieval_depth,
                         "returned_page_count": len(retrieved),
                         "top_pages": [
                             {
@@ -586,7 +606,7 @@ def run_selection_only_session(
                                 "page_idx": int(page_idx),
                                 "score": float(score),
                             }
-                            for doc_id, page_idx, score in retrieved[:retrieval_depth]
+                            for doc_id, page_idx, score in retrieved[:query_retrieval_depth]
                         ],
                         "top_docs": top_docs,
                     }
@@ -602,7 +622,8 @@ def run_selection_only_session(
                 "planner_reply": planner_reply,
                 "hop_queries": hop_queries,
                 "topk_docs_per_hop": selection_topk_docs_per_hop,
-                "retrieval_depth_per_query": retrieval_depth,
+                "retrieval_depth_per_query": base_retrieval_depth,
+                "descriptor_retrieval_depth_per_query": max(base_retrieval_depth * 4, 64),
             },
     }
 
