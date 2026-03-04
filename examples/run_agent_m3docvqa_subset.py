@@ -25,6 +25,7 @@ from m3docrag.utils.paths import LOCAL_DATA_DIR, LOCAL_EMBEDDINGS_DIR
 from run_agent_rag import (  # type: ignore
     build_rag_model,
     configure_warning_filters,
+    load_context_map,
     make_candidate_context_fn,
     make_llm_call_local_hf,
     make_llm_call_stub,
@@ -161,6 +162,16 @@ def parse_args():
         type=int,
         default=2,
         help="Max unique docs selected from each hop query in --selection-only mode.",
+    )
+    p.add_argument(
+        "--page-summaries-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON/JSONL file keyed by (doc_id, page_idx) with page summaries. "
+            "When provided, --selection-only reranks retrieved pages using summary-query lexical match "
+            "before doc selection."
+        ),
     )
     p.add_argument("--stop-on-error", action="store_true")
     return p.parse_args()
@@ -504,12 +515,112 @@ def _selection_only_retrieval_depth(selection_topk_docs_per_hop: int) -> int:
     return max(quota * 8, 8)
 
 
+def _page_key_variants(doc_id: str, page_idx: int) -> list[str]:
+    return [
+        f"{doc_id}_page{page_idx}",
+        f"{doc_id}#p{page_idx}",
+        f"{doc_id}:{page_idx}",
+        f"{doc_id}/{page_idx}",
+    ]
+
+
+def _lookup_page_summary(page_summary_map: Optional[dict[str, str]], doc_id: str, page_idx: int) -> Optional[str]:
+    if not page_summary_map:
+        return None
+    for key in _page_key_variants(doc_id, page_idx):
+        value = page_summary_map.get(key)
+        if value:
+            return _norm_text(value)
+    return None
+
+
 def _is_descriptor_focused_query(query: str) -> bool:
     q = _norm_text(query).casefold()
     tokens = re.findall(r"[A-Za-z0-9']+", q)
     if len(tokens) > 8:
         return False
     return any(marker in q for marker in ("logo", "poster", "cover", "flag"))
+
+
+def _summary_match_score(query: str, summary_text: Optional[str]) -> float:
+    if not summary_text:
+        return 0.0
+
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "as",
+        "at",
+        "by",
+        "for",
+        "from",
+        "has",
+        "have",
+        "in",
+        "is",
+        "it",
+        "its",
+        "of",
+        "on",
+        "or",
+        "that",
+        "the",
+        "their",
+        "this",
+        "to",
+        "what",
+        "when",
+        "where",
+        "which",
+        "who",
+        "with",
+    }
+
+    query_tokens = [tok for tok in re.findall(r"[A-Za-z0-9']+", query.casefold()) if tok not in stopwords]
+    if not query_tokens:
+        return 0.0
+
+    summary_norm = summary_text.casefold()
+    summary_tokens = set(re.findall(r"[A-Za-z0-9']+", summary_norm))
+    overlap = [tok for tok in query_tokens if tok in summary_tokens]
+    if not overlap:
+        return 0.0
+
+    overlap_count = len(overlap)
+    coverage = overlap_count / max(len(set(query_tokens)), 1)
+    bigram_hits = 0
+    for idx in range(len(query_tokens) - 1):
+        bigram = f"{query_tokens[idx]} {query_tokens[idx + 1]}"
+        if bigram in summary_norm:
+            bigram_hits += 1
+    exact_query_hit = 1.0 if _norm_text(query).casefold() in _norm_text(summary_text).casefold() else 0.0
+    return (coverage * 4.0) + (overlap_count * 0.35) + (bigram_hits * 1.5) + (exact_query_hit * 6.0)
+
+
+def _rerank_with_page_summaries(
+    *,
+    query: str,
+    retrieved: list[tuple[str, int, float]],
+    page_summary_map: Optional[dict[str, str]],
+) -> list[tuple[str, int, float]]:
+    if not page_summary_map or not retrieved:
+        return retrieved
+
+    enriched = []
+    any_summary_match = False
+    for idx, (doc_id, page_idx, score) in enumerate(retrieved):
+        summary_text = _lookup_page_summary(page_summary_map, str(doc_id), int(page_idx))
+        match_score = _summary_match_score(query, summary_text)
+        if match_score > 0:
+            any_summary_match = True
+        enriched.append((match_score, float(score), idx, (str(doc_id), int(page_idx), float(score))))
+
+    if not any_summary_match:
+        return retrieved
+
+    enriched.sort(key=lambda item: (-item[0], -item[1], item[2]))
+    return [item[3] for item in enriched]
 
 
 def _select_selection_only_pages(
@@ -560,7 +671,11 @@ def _select_selection_only_pages(
     return picked
 
 
-def _top_docs_payload_from_pages(rows: list[tuple[str, int, float]], limit: int) -> list[dict]:
+def _top_docs_payload_from_pages(
+    rows: list[tuple[str, int, float]],
+    limit: int,
+    page_summary_map: Optional[dict[str, str]] = None,
+) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
     rank = 0
@@ -569,16 +684,37 @@ def _top_docs_payload_from_pages(rows: list[tuple[str, int, float]], limit: int)
             continue
         seen.add(doc_id)
         rank += 1
-        out.append(
-            {
-                "doc_id": str(doc_id),
-                "returned_rank": rank,
-                "best_page_idx": int(page_idx),
-                "best_page_score": float(score),
-            }
-        )
+        row = {
+            "doc_id": str(doc_id),
+            "returned_rank": rank,
+            "best_page_idx": int(page_idx),
+            "best_page_score": float(score),
+        }
+        summary_text = _lookup_page_summary(page_summary_map, str(doc_id), int(page_idx))
+        if summary_text:
+            row["page_summary"] = summary_text[:240]
+        out.append(row)
         if len(out) >= limit:
             break
+    return out
+
+
+def _top_pages_payload_from_pages(
+    rows: list[tuple[str, int, float]],
+    limit: int,
+    page_summary_map: Optional[dict[str, str]] = None,
+) -> list[dict]:
+    out: list[dict] = []
+    for doc_id, page_idx, score in rows[:limit]:
+        row = {
+            "doc_id": str(doc_id),
+            "page_idx": int(page_idx),
+            "score": float(score),
+        }
+        summary_text = _lookup_page_summary(page_summary_map, str(doc_id), int(page_idx))
+        if summary_text:
+            row["page_summary"] = summary_text[:240]
+        out.append(row)
     return out
 
 
@@ -589,6 +725,7 @@ def run_selection_only_session(
     docid2embs: dict,
     selection_max_hop_queries: int,
     selection_topk_docs_per_hop: int,
+    page_summary_map: Optional[dict[str, str]] = None,
 ):
     hop_queries, planner_reply = _plan_selection_hop_queries(
         question=question,
@@ -599,6 +736,8 @@ def run_selection_only_session(
         len(hop_queries),
         hop_queries,
     )
+    if page_summary_map:
+        logger.info("selection-only summary rerank active: {} page summaries loaded", len(page_summary_map))
 
     steps = []
     selected_doc_ids: set[str] = set()
@@ -621,10 +760,16 @@ def run_selection_only_session(
             single_page_from_each_doc=True,
             show_progress=False,
         )
+        retrieved = _rerank_with_page_summaries(
+            query=hop_query,
+            retrieved=retrieved,
+            page_summary_map=page_summary_map,
+        )
 
         top_docs = _top_docs_payload_from_pages(
             retrieved,
             limit=query_retrieval_depth,
+            page_summary_map=page_summary_map,
         )
         selected_pages = _select_selection_only_pages(
             retrieved=retrieved,
@@ -647,14 +792,11 @@ def run_selection_only_session(
                         "query": hop_query,
                         "requested_page_count": query_retrieval_depth,
                         "returned_page_count": len(retrieved),
-                        "top_pages": [
-                            {
-                                "doc_id": str(doc_id),
-                                "page_idx": int(page_idx),
-                                "score": float(score),
-                            }
-                            for doc_id, page_idx, score in retrieved[:query_retrieval_depth]
-                        ],
+                        "top_pages": _top_pages_payload_from_pages(
+                            retrieved,
+                            limit=query_retrieval_depth,
+                            page_summary_map=page_summary_map,
+                        ),
                         "top_docs": top_docs,
                     }
                 ],
@@ -671,6 +813,7 @@ def run_selection_only_session(
                 "topk_docs_per_hop": selection_topk_docs_per_hop,
                 "retrieval_depth_per_query": base_retrieval_depth,
                 "descriptor_retrieval_depth_per_query": max(base_retrieval_depth * 4, 64),
+                "page_summaries_enabled": bool(page_summary_map),
             },
     }
 
@@ -1095,6 +1238,11 @@ def main():
     if args.clear_doc_cache_each_example:
         logger.info("Enabled --clear-doc-cache-each-example (lower memory, slower runtime).")
 
+    page_summary_map = None
+    if args.page_summaries_file is not None:
+        page_summary_map = load_context_map(args.page_summaries_file)
+        logger.info("Loaded {} page summaries from {}", len(page_summary_map), args.page_summaries_file)
+
     args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     summary_path = args.summary_json or (args.output_jsonl.parent / f"{args.output_jsonl.stem}_summary.json")
 
@@ -1186,6 +1334,7 @@ def main():
                         docid2embs=docid2embs,
                         selection_max_hop_queries=args.selection_max_hop_queries,
                         selection_topk_docs_per_hop=args.selection_topk_docs_per_hop,
+                        page_summary_map=page_summary_map,
                     )
                 else:
                     candidate_context_fn = make_candidate_context_fn(
@@ -1271,6 +1420,7 @@ def main():
             "selection_planner": ("heuristic" if args.selection_only else None),
             "selection_max_hop_queries": args.selection_max_hop_queries,
             "selection_topk_docs_per_hop": args.selection_topk_docs_per_hop,
+            "page_summaries_file": (str(args.page_summaries_file) if args.page_summaries_file else None),
             "policy_backend": args.policy_backend,
             "policy_model": args.policy_model,
             "policy_device": policy_device,
