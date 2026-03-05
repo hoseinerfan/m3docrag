@@ -625,16 +625,27 @@ def _rerank_with_page_summaries(
 
 def _select_selection_only_pages(
     *,
+    query: str,
     retrieved: list[tuple[str, int, float]],
     selected_doc_ids: set[str],
     quota: int,
     descriptor_focused: bool,
+    page_summary_map: Optional[dict[str, str]] = None,
 ) -> list[tuple[str, int, float]]:
     if quota <= 0:
         return []
 
     ranked_available = [
-        (rank, str(doc_id), int(page_idx), float(score))
+        (
+            rank,
+            str(doc_id),
+            int(page_idx),
+            float(score),
+            _summary_match_score(
+                query,
+                _lookup_page_summary(page_summary_map, str(doc_id), int(page_idx)),
+            ),
+        )
         for rank, (doc_id, page_idx, score) in enumerate(retrieved, start=1)
         if doc_id not in selected_doc_ids
     ]
@@ -644,23 +655,43 @@ def _select_selection_only_pages(
     picked: list[tuple[str, int, float]] = []
     picked_doc_ids: set[str] = set()
 
-    def add_candidate(candidate: tuple[int, str, int, float]) -> bool:
-        _, doc_id, page_idx, score = candidate
+    def add_candidate(candidate: tuple[int, str, int, float, float]) -> bool:
+        _, doc_id, page_idx, score, _ = candidate
         if doc_id in selected_doc_ids or doc_id in picked_doc_ids:
             return False
         picked.append((doc_id, page_idx, score))
         picked_doc_ids.add(doc_id)
         return True
 
-    if descriptor_focused:
-        add_candidate(ranked_available[0])
-        if quota > 1:
-            deeper_band = [candidate for candidate in ranked_available if 9 <= candidate[0] <= 24]
-            if not deeper_band:
-                deeper_band = [candidate for candidate in ranked_available if candidate[0] >= 5]
-            if deeper_band:
+    # Always keep the best-ranked unseen doc for stability.
+    add_candidate(ranked_available[0])
+
+    # Stage-2 summary-aware selection:
+    # Use page summaries to pick one extra evidence doc from a bounded window.
+    if quota > 1 and page_summary_map:
+        rank_window = 64 if descriptor_focused else 40
+        candidates = [c for c in ranked_available if 2 <= c[0] <= rank_window and c[4] > 0]
+        if descriptor_focused:
+            deeper = [c for c in candidates if 9 <= c[0] <= 24]
+            if deeper:
+                candidates = deeper
+        if candidates:
+            best_summary = max(candidates, key=lambda c: c[4])[4]
+            best_candidates = [c for c in candidates if c[4] == best_summary]
+            if descriptor_focused:
                 target_band_rank = 13
-                add_candidate(min(deeper_band, key=lambda candidate: abs(candidate[0] - target_band_rank)))
+                chosen = min(best_candidates, key=lambda c: abs(c[0] - target_band_rank))
+            else:
+                chosen = min(best_candidates, key=lambda c: c[0])
+            add_candidate(chosen)
+
+    if descriptor_focused and len(picked) < quota:
+        deeper_band = [candidate for candidate in ranked_available if 9 <= candidate[0] <= 24]
+        if not deeper_band:
+            deeper_band = [candidate for candidate in ranked_available if candidate[0] >= 5]
+        if deeper_band:
+            target_band_rank = 13
+            add_candidate(min(deeper_band, key=lambda candidate: abs(candidate[0] - target_band_rank)))
 
     for candidate in ranked_available:
         if len(picked) >= quota:
@@ -675,6 +706,7 @@ def _top_docs_payload_from_pages(
     rows: list[tuple[str, int, float]],
     limit: int,
     page_summary_map: Optional[dict[str, str]] = None,
+    query: Optional[str] = None,
 ) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
@@ -693,6 +725,8 @@ def _top_docs_payload_from_pages(
         summary_text = _lookup_page_summary(page_summary_map, str(doc_id), int(page_idx))
         if summary_text:
             row["page_summary"] = summary_text[:240]
+            if query:
+                row["summary_match_score"] = round(_summary_match_score(query, summary_text), 4)
         out.append(row)
         if len(out) >= limit:
             break
@@ -703,6 +737,7 @@ def _top_pages_payload_from_pages(
     rows: list[tuple[str, int, float]],
     limit: int,
     page_summary_map: Optional[dict[str, str]] = None,
+    query: Optional[str] = None,
 ) -> list[dict]:
     out: list[dict] = []
     for doc_id, page_idx, score in rows[:limit]:
@@ -714,6 +749,8 @@ def _top_pages_payload_from_pages(
         summary_text = _lookup_page_summary(page_summary_map, str(doc_id), int(page_idx))
         if summary_text:
             row["page_summary"] = summary_text[:240]
+            if query:
+                row["summary_match_score"] = round(_summary_match_score(query, summary_text), 4)
         out.append(row)
     return out
 
@@ -760,22 +797,20 @@ def run_selection_only_session(
             single_page_from_each_doc=True,
             show_progress=False,
         )
-        retrieved = _rerank_with_page_summaries(
-            query=hop_query,
-            retrieved=retrieved,
-            page_summary_map=page_summary_map,
-        )
 
         top_docs = _top_docs_payload_from_pages(
             retrieved,
             limit=query_retrieval_depth,
             page_summary_map=page_summary_map,
+            query=hop_query,
         )
         selected_pages = _select_selection_only_pages(
+            query=hop_query,
             retrieved=retrieved,
             selected_doc_ids=selected_doc_ids,
             quota=selection_topk_docs_per_hop,
             descriptor_focused=descriptor_focused,
+            page_summary_map=page_summary_map,
         )
 
         steps.append(
@@ -796,6 +831,7 @@ def run_selection_only_session(
                             retrieved,
                             limit=query_retrieval_depth,
                             page_summary_map=page_summary_map,
+                            query=hop_query,
                         ),
                         "top_docs": top_docs,
                     }
