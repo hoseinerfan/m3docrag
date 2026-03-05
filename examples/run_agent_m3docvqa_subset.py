@@ -164,6 +164,24 @@ def parse_args():
         help="Max unique docs selected from each hop query in --selection-only mode.",
     )
     p.add_argument(
+        "--selection-root-topk-docs",
+        type=int,
+        default=None,
+        help="Optional override for docs selected from the root query in --selection-only mode.",
+    )
+    p.add_argument(
+        "--selection-variant-topk-docs",
+        type=int,
+        default=None,
+        help="Optional override for docs selected from each variant query in --selection-only mode.",
+    )
+    p.add_argument(
+        "--selection-max-variant-queries",
+        type=int,
+        default=None,
+        help="Optional cap on number of variant queries kept after the root query in --selection-only mode.",
+    )
+    p.add_argument(
         "--page-summaries-file",
         type=Path,
         default=None,
@@ -762,12 +780,19 @@ def run_selection_only_session(
     docid2embs: dict,
     selection_max_hop_queries: int,
     selection_topk_docs_per_hop: int,
+    selection_root_topk_docs: Optional[int] = None,
+    selection_variant_topk_docs: Optional[int] = None,
+    selection_max_variant_queries: Optional[int] = None,
     page_summary_map: Optional[dict[str, str]] = None,
 ):
     hop_queries, planner_reply = _plan_selection_hop_queries(
         question=question,
         max_hops=selection_max_hop_queries,
     )
+    if hop_queries and selection_max_variant_queries is not None:
+        root_query = hop_queries[0]
+        variant_queries = hop_queries[1 : 1 + max(selection_max_variant_queries, 0)]
+        hop_queries = [root_query] + variant_queries
     logger.info(
         "selection-only plan: {} queries | {}",
         len(hop_queries),
@@ -778,9 +803,20 @@ def run_selection_only_session(
 
     steps = []
     selected_doc_ids: set[str] = set()
-    base_retrieval_depth = _selection_only_retrieval_depth(selection_topk_docs_per_hop)
+    max_selection_quota = max(
+        selection_topk_docs_per_hop,
+        selection_root_topk_docs or 0,
+        selection_variant_topk_docs or 0,
+    )
+    base_retrieval_depth = _selection_only_retrieval_depth(max_selection_quota)
 
     for turn, hop_query in enumerate(hop_queries, start=1):
+        if turn == 1 and selection_root_topk_docs is not None:
+            selection_quota = max(selection_root_topk_docs, 0)
+        elif turn > 1 and selection_variant_topk_docs is not None:
+            selection_quota = max(selection_variant_topk_docs, 0)
+        else:
+            selection_quota = max(selection_topk_docs_per_hop, 0)
         descriptor_focused = _is_descriptor_focused_query(hop_query)
         query_retrieval_depth = (
             max(base_retrieval_depth * 4, 64)
@@ -808,7 +844,7 @@ def run_selection_only_session(
             query=hop_query,
             retrieved=retrieved,
             selected_doc_ids=selected_doc_ids,
-            quota=selection_topk_docs_per_hop,
+            quota=selection_quota,
             descriptor_focused=descriptor_focused,
             page_summary_map=page_summary_map,
         )
@@ -847,6 +883,9 @@ def run_selection_only_session(
                 "planner_reply": planner_reply,
                 "hop_queries": hop_queries,
                 "topk_docs_per_hop": selection_topk_docs_per_hop,
+                "root_topk_docs": selection_root_topk_docs,
+                "variant_topk_docs": selection_variant_topk_docs,
+                "max_variant_queries": selection_max_variant_queries,
                 "retrieval_depth_per_query": base_retrieval_depth,
                 "descriptor_retrieval_depth_per_query": max(base_retrieval_depth * 4, 64),
                 "page_summaries_enabled": bool(page_summary_map),
@@ -1370,6 +1409,9 @@ def main():
                         docid2embs=docid2embs,
                         selection_max_hop_queries=args.selection_max_hop_queries,
                         selection_topk_docs_per_hop=args.selection_topk_docs_per_hop,
+                        selection_root_topk_docs=args.selection_root_topk_docs,
+                        selection_variant_topk_docs=args.selection_variant_topk_docs,
+                        selection_max_variant_queries=args.selection_max_variant_queries,
                         page_summary_map=page_summary_map,
                     )
                 else:
@@ -1456,6 +1498,9 @@ def main():
             "selection_planner": ("heuristic" if args.selection_only else None),
             "selection_max_hop_queries": args.selection_max_hop_queries,
             "selection_topk_docs_per_hop": args.selection_topk_docs_per_hop,
+            "selection_root_topk_docs": args.selection_root_topk_docs,
+            "selection_variant_topk_docs": args.selection_variant_topk_docs,
+            "selection_max_variant_queries": args.selection_max_variant_queries,
             "page_summaries_file": (str(args.page_summaries_file) if args.page_summaries_file else None),
             "policy_backend": args.policy_backend,
             "policy_model": args.policy_model,
