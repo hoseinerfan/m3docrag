@@ -182,6 +182,20 @@ def parse_args():
         help="Optional cap on number of variant queries kept after the root query in --selection-only mode.",
     )
     p.add_argument(
+        "--selection-summary-full-scan",
+        action="store_true",
+        help=(
+            "When page summaries are provided, score all available summarized pages across the doc pool "
+            "for each query and prepend top metadata candidates before final selection."
+        ),
+    )
+    p.add_argument(
+        "--selection-summary-full-scan-topk",
+        type=int,
+        default=1000,
+        help="Max metadata candidates kept per query when --selection-summary-full-scan is enabled.",
+    )
+    p.add_argument(
         "--page-summaries-file",
         type=Path,
         default=None,
@@ -552,6 +566,44 @@ def _lookup_page_summary(page_summary_map: Optional[dict[str, str]], doc_id: str
     return None
 
 
+def _parse_page_key(key: str) -> Optional[tuple[str, int]]:
+    key = str(key)
+    m = re.match(r"^(?P<doc>.+)_page(?P<page>\d+)$", key)
+    if m:
+        return m.group("doc"), int(m.group("page"))
+    m = re.match(r"^(?P<doc>.+)#p(?P<page>\d+)$", key)
+    if m:
+        return m.group("doc"), int(m.group("page"))
+    m = re.match(r"^(?P<doc>.+):(?P<page>\d+)$", key)
+    if m:
+        return m.group("doc"), int(m.group("page"))
+    m = re.match(r"^(?P<doc>.+)/(?P<page>\d+)$", key)
+    if m:
+        return m.group("doc"), int(m.group("page"))
+    return None
+
+
+def _build_doc_page_summary_index(
+    page_summary_map: Optional[dict[str, str]],
+    allowed_doc_ids: set[str],
+) -> dict[str, list[tuple[int, str]]]:
+    out: dict[str, list[tuple[int, str]]] = {}
+    if not page_summary_map:
+        return out
+    for key, value in page_summary_map.items():
+        parsed = _parse_page_key(key)
+        if parsed is None:
+            continue
+        doc_id, page_idx = parsed
+        if doc_id not in allowed_doc_ids:
+            continue
+        text = _norm_text(value)
+        if not text:
+            continue
+        out.setdefault(doc_id, []).append((page_idx, text))
+    return out
+
+
 def _is_descriptor_focused_query(query: str) -> bool:
     q = _norm_text(query).casefold()
     tokens = re.findall(r"[A-Za-z0-9']+", q)
@@ -614,6 +666,30 @@ def _summary_match_score(query: str, summary_text: Optional[str]) -> float:
             bigram_hits += 1
     exact_query_hit = 1.0 if _norm_text(query).casefold() in _norm_text(summary_text).casefold() else 0.0
     return (coverage * 4.0) + (overlap_count * 0.35) + (bigram_hits * 1.5) + (exact_query_hit * 6.0)
+
+
+def _metadata_full_scan_candidates(
+    *,
+    query: str,
+    doc_page_summary_index: dict[str, list[tuple[int, str]]],
+    topk_docs: int,
+) -> list[tuple[str, int, float]]:
+    candidates: list[tuple[str, int, float]] = []
+    for doc_id, page_summaries in doc_page_summary_index.items():
+        best_score = 0.0
+        best_page_idx = None
+        for page_idx, summary_text in page_summaries:
+            score = _summary_match_score(query, summary_text)
+            if score > best_score:
+                best_score = score
+                best_page_idx = page_idx
+        if best_page_idx is None:
+            continue
+        candidates.append((doc_id, best_page_idx, float(best_score)))
+    candidates.sort(key=lambda x: x[2], reverse=True)
+    if topk_docs is not None and topk_docs > 0:
+        candidates = candidates[:topk_docs]
+    return candidates
 
 
 def _rerank_with_page_summaries(
@@ -783,6 +859,8 @@ def run_selection_only_session(
     selection_root_topk_docs: Optional[int] = None,
     selection_variant_topk_docs: Optional[int] = None,
     selection_max_variant_queries: Optional[int] = None,
+    selection_summary_full_scan: bool = False,
+    selection_summary_full_scan_topk: int = 1000,
     page_summary_map: Optional[dict[str, str]] = None,
 ):
     hop_queries, planner_reply = _plan_selection_hop_queries(
@@ -800,6 +878,13 @@ def run_selection_only_session(
     )
     if page_summary_map:
         logger.info("selection-only summary rerank active: {} page summaries loaded", len(page_summary_map))
+    doc_page_summary_index = _build_doc_page_summary_index(page_summary_map, set(docid2embs.keys()))
+    if selection_summary_full_scan and doc_page_summary_index:
+        logger.info(
+            "selection-only metadata full-scan active: docs_with_summaries={} topk={}",
+            len(doc_page_summary_index),
+            selection_summary_full_scan_topk,
+        )
 
     steps = []
     selected_doc_ids: set[str] = set()
@@ -833,16 +918,28 @@ def run_selection_only_session(
             single_page_from_each_doc=True,
             show_progress=False,
         )
+        metadata_candidates = []
+        if selection_summary_full_scan and doc_page_summary_index:
+            metadata_candidates = _metadata_full_scan_candidates(
+                query=hop_query,
+                doc_page_summary_index=doc_page_summary_index,
+                topk_docs=max(selection_summary_full_scan_topk, 0),
+            )
+        if metadata_candidates:
+            seen_doc_ids = {doc_id for doc_id, _, _ in metadata_candidates}
+            retrieved_for_selection = metadata_candidates + [x for x in retrieved if x[0] not in seen_doc_ids]
+        else:
+            retrieved_for_selection = retrieved
 
         top_docs = _top_docs_payload_from_pages(
-            retrieved,
+            retrieved_for_selection,
             limit=query_retrieval_depth,
             page_summary_map=page_summary_map,
             query=hop_query,
         )
         selected_pages = _select_selection_only_pages(
             query=hop_query,
-            retrieved=retrieved,
+            retrieved=retrieved_for_selection,
             selected_doc_ids=selected_doc_ids,
             quota=selection_quota,
             descriptor_focused=descriptor_focused,
@@ -863,8 +960,9 @@ def run_selection_only_session(
                         "query": hop_query,
                         "requested_page_count": query_retrieval_depth,
                         "returned_page_count": len(retrieved),
+                        "metadata_full_scan_candidates": len(metadata_candidates),
                         "top_pages": _top_pages_payload_from_pages(
-                            retrieved,
+                            retrieved_for_selection,
                             limit=query_retrieval_depth,
                             page_summary_map=page_summary_map,
                             query=hop_query,
@@ -889,6 +987,8 @@ def run_selection_only_session(
                 "retrieval_depth_per_query": base_retrieval_depth,
                 "descriptor_retrieval_depth_per_query": max(base_retrieval_depth * 4, 64),
                 "page_summaries_enabled": bool(page_summary_map),
+                "summary_full_scan": selection_summary_full_scan,
+                "summary_full_scan_topk": selection_summary_full_scan_topk,
             },
     }
 
@@ -1412,6 +1512,8 @@ def main():
                         selection_root_topk_docs=args.selection_root_topk_docs,
                         selection_variant_topk_docs=args.selection_variant_topk_docs,
                         selection_max_variant_queries=args.selection_max_variant_queries,
+                        selection_summary_full_scan=args.selection_summary_full_scan,
+                        selection_summary_full_scan_topk=args.selection_summary_full_scan_topk,
                         page_summary_map=page_summary_map,
                     )
                 else:
@@ -1501,6 +1603,8 @@ def main():
             "selection_root_topk_docs": args.selection_root_topk_docs,
             "selection_variant_topk_docs": args.selection_variant_topk_docs,
             "selection_max_variant_queries": args.selection_max_variant_queries,
+            "selection_summary_full_scan": args.selection_summary_full_scan,
+            "selection_summary_full_scan_topk": args.selection_summary_full_scan_topk,
             "page_summaries_file": (str(args.page_summaries_file) if args.page_summaries_file else None),
             "policy_backend": args.policy_backend,
             "policy_model": args.policy_model,
