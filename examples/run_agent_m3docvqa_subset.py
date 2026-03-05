@@ -205,6 +205,27 @@ def parse_args():
             "before doc selection."
         ),
     )
+    p.add_argument(
+        "--page-visual-metadata-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional JSON/JSONL file keyed by (doc_id, page_idx) with visual metadata "
+            "(for example logo/torch/crest flags and confidence)."
+        ),
+    )
+    p.add_argument(
+        "--selection-visual-boost",
+        type=float,
+        default=2.0,
+        help="Weight multiplier for visual-metadata match score in --selection-only mode.",
+    )
+    p.add_argument(
+        "--selection-visual-min-confidence",
+        type=float,
+        default=0.4,
+        help="Minimum visual-metadata confidence used for visual score in --selection-only mode.",
+    )
     p.add_argument("--stop-on-error", action="store_true")
     return p.parse_args()
 
@@ -566,6 +587,174 @@ def _lookup_page_summary(page_summary_map: Optional[dict[str, str]], doc_id: str
     return None
 
 
+def _to_bool(value) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        v = value.strip().casefold()
+        if v in {"true", "t", "yes", "y", "1"}:
+            return True
+        if v in {"false", "f", "no", "n", "0"}:
+            return False
+    return None
+
+
+def _to_float(value) -> Optional[float]:
+    try:
+        return float(value)
+    except Exception:
+        return None
+
+
+def _extract_first_json_object(text: str) -> Optional[dict]:
+    if not text:
+        return None
+    candidate = text.strip()
+    if candidate.startswith("{") and candidate.endswith("}"):
+        try:
+            payload = json.loads(candidate)
+            if isinstance(payload, dict):
+                return payload
+        except Exception:
+            pass
+    m = re.search(r"\{.*\}", candidate, re.DOTALL)
+    if not m:
+        return None
+    try:
+        payload = json.loads(m.group(0))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _negated_mention(text: str, term_pattern: str) -> bool:
+    neg_patterns = [
+        rf"\b(no|not|none|without|absent|lacks?|lack(?:ing)?)\b[^.]{{0,140}}\b{term_pattern}\b",
+        rf"\b{term_pattern}\b[^.]{{0,120}}\b(no|not|none|without|absent)\b",
+    ]
+    return any(re.search(pat, text, re.IGNORECASE) for pat in neg_patterns)
+
+
+def _coerce_visual_metadata(obj) -> Optional[dict[str, float | bool]]:
+    if obj is None:
+        return None
+
+    payload = obj if isinstance(obj, dict) else None
+    if payload is None and isinstance(obj, str):
+        payload = _extract_first_json_object(obj)
+
+    three_torches = None
+    logo_visible = None
+    shield_or_crest = None
+    confidence = None
+
+    if isinstance(payload, dict):
+        for key in (
+            "three_torches_logo_visible",
+            "three_torch_logo_visible",
+            "three_torches_visible",
+            "torch_logo_visible",
+        ):
+            if key in payload:
+                three_torches = _to_bool(payload.get(key))
+                break
+        for key in ("logo_visible", "emblem_visible", "symbol_visible"):
+            if key in payload:
+                logo_visible = _to_bool(payload.get(key))
+                break
+        for key in ("shield_or_crest_visible", "crest_visible", "shield_visible"):
+            if key in payload:
+                shield_or_crest = _to_bool(payload.get(key))
+                break
+        for key in ("confidence", "conf", "score"):
+            if key in payload:
+                confidence = _to_float(payload.get(key))
+                break
+
+    raw_text = None
+    if isinstance(obj, str):
+        raw_text = obj
+    elif isinstance(obj, dict):
+        maybe_text = obj.get("summary") or obj.get("text") or obj.get("snippet") or obj.get("content")
+        if isinstance(maybe_text, str):
+            raw_text = maybe_text
+    if raw_text:
+        lower = raw_text.casefold()
+        has_torch = bool(re.search(r"\btorch(?:es)?\b", lower))
+        has_logo = bool(re.search(r"\b(logo|emblem|symbol)\b", lower))
+        has_shield_or_crest = bool(re.search(r"\b(shield|crest|seal)\b", lower))
+        if three_torches is None:
+            three_torches = bool(re.search(r"\bthree\b[^.]{0,40}\btorch(?:es)?\b", lower)) and not _negated_mention(
+                lower, r"torch(?:es)?"
+            )
+        if logo_visible is None:
+            logo_visible = has_logo and not _negated_mention(lower, r"logo|emblem|symbol")
+        if shield_or_crest is None:
+            shield_or_crest = has_shield_or_crest and not _negated_mention(lower, r"shield|crest|seal")
+        if confidence is None:
+            m = re.search(r"\bconfidence\b[^0-9]*([01](?:\.\d+)?)", lower)
+            if m:
+                confidence = _to_float(m.group(1))
+            elif any((three_torches, logo_visible, shield_or_crest)):
+                confidence = 0.6
+
+    if confidence is None:
+        confidence = 0.0
+    confidence = max(0.0, min(float(confidence), 1.0))
+    three_torches = bool(three_torches)
+    logo_visible = bool(logo_visible)
+    shield_or_crest = bool(shield_or_crest)
+    if not (three_torches or logo_visible or shield_or_crest):
+        return None
+    return {
+        "three_torches_logo_visible": three_torches,
+        "logo_visible": logo_visible,
+        "shield_or_crest_visible": shield_or_crest,
+        "confidence": confidence,
+    }
+
+
+def load_page_visual_metadata_map(path: Path) -> dict[str, dict[str, float | bool]]:
+    payload = _load_json_or_jsonl(path)
+    out: dict[str, dict[str, float | bool]] = {}
+
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            if _parse_page_key(str(key)) is None:
+                continue
+            meta = _coerce_visual_metadata(value)
+            if meta is not None:
+                out[str(key)] = meta
+        return out
+
+    if not isinstance(payload, list):
+        return out
+
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        doc_id = row.get("doc_id") or row.get("document_id")
+        page_idx = row.get("page_idx", row.get("page", row.get("page_id")))
+        if doc_id is None or page_idx is None:
+            continue
+        try:
+            page_idx = int(page_idx)
+        except Exception:
+            continue
+        meta = _coerce_visual_metadata(row)
+        if meta is None:
+            for key in ("summary", "text", "snippet", "content"):
+                if isinstance(row.get(key), str):
+                    meta = _coerce_visual_metadata(row.get(key))
+                    if meta is not None:
+                        break
+        if meta is not None:
+            out[f"{doc_id}_page{page_idx}"] = meta
+    return out
+
+
 def _parse_page_key(key: str) -> Optional[tuple[str, int]]:
     key = str(key)
     m = re.match(r"^(?P<doc>.+)_page(?P<page>\d+)$", key)
@@ -604,12 +793,98 @@ def _build_doc_page_summary_index(
     return out
 
 
+def _build_doc_page_index(
+    page_summary_map: Optional[dict[str, str]],
+    page_visual_meta_map: Optional[dict[str, dict[str, float | bool]]],
+    allowed_doc_ids: set[str],
+) -> dict[str, list[int]]:
+    out: dict[str, set[int]] = {}
+    for source_map in (page_summary_map or {}, page_visual_meta_map or {}):
+        for key in source_map:
+            parsed = _parse_page_key(key)
+            if parsed is None:
+                continue
+            doc_id, page_idx = parsed
+            if doc_id not in allowed_doc_ids:
+                continue
+            out.setdefault(doc_id, set()).add(page_idx)
+    return {doc_id: sorted(pages) for doc_id, pages in out.items()}
+
+
 def _is_descriptor_focused_query(query: str) -> bool:
     q = _norm_text(query).casefold()
     tokens = re.findall(r"[A-Za-z0-9']+", q)
     if len(tokens) > 8:
         return False
-    return any(marker in q for marker in ("logo", "poster", "cover", "flag"))
+    return any(
+        marker in q for marker in ("logo", "poster", "cover", "flag", "symbol", "emblem", "crest", "shield", "torch")
+    )
+
+
+def _lookup_page_visual_meta(
+    page_visual_meta_map: Optional[dict[str, dict[str, float | bool]]],
+    doc_id: str,
+    page_idx: int,
+) -> Optional[dict[str, float | bool]]:
+    if not page_visual_meta_map:
+        return None
+    for key in _page_key_variants(doc_id, page_idx):
+        value = page_visual_meta_map.get(key)
+        if value:
+            return value
+    return None
+
+
+def _visual_match_score(
+    query: str,
+    visual_meta: Optional[dict[str, float | bool]],
+    *,
+    descriptor_focused: bool,
+    visual_boost: float,
+    min_confidence: float,
+) -> float:
+    if not visual_meta:
+        return 0.0
+    confidence = float(visual_meta.get("confidence", 0.0) or 0.0)
+    if confidence < min_confidence:
+        return 0.0
+
+    q = _norm_text(query).casefold()
+    wants_torch = bool(re.search(r"\btorch(?:es)?\b", q))
+    wants_logo = any(tok in q for tok in ("logo", "emblem", "symbol"))
+    wants_shield = any(tok in q for tok in ("shield", "crest", "seal"))
+
+    score = 0.0
+    if wants_torch and bool(visual_meta.get("three_torches_logo_visible")):
+        score += 3.0 * confidence
+    if wants_logo and bool(visual_meta.get("logo_visible")):
+        score += 1.8 * confidence
+    if wants_shield and bool(visual_meta.get("shield_or_crest_visible")):
+        score += 1.8 * confidence
+    if descriptor_focused and score == 0.0:
+        if bool(visual_meta.get("logo_visible")) or bool(visual_meta.get("shield_or_crest_visible")):
+            score += 0.5 * confidence
+    return score * max(visual_boost, 0.0)
+
+
+def _combined_metadata_score(
+    query: str,
+    summary_text: Optional[str],
+    visual_meta: Optional[dict[str, float | bool]],
+    *,
+    descriptor_focused: bool,
+    visual_boost: float,
+    min_confidence: float,
+) -> tuple[float, float, float]:
+    summary_score = _summary_match_score(query, summary_text)
+    visual_score = _visual_match_score(
+        query,
+        visual_meta,
+        descriptor_focused=descriptor_focused,
+        visual_boost=visual_boost,
+        min_confidence=min_confidence,
+    )
+    return summary_score + visual_score, summary_score, visual_score
 
 
 def _summary_match_score(query: str, summary_text: Optional[str]) -> float:
@@ -671,15 +946,27 @@ def _summary_match_score(query: str, summary_text: Optional[str]) -> float:
 def _metadata_full_scan_candidates(
     *,
     query: str,
-    doc_page_summary_index: dict[str, list[tuple[int, str]]],
+    doc_page_index: dict[str, list[int]],
+    page_summary_map: Optional[dict[str, str]],
+    page_visual_meta_map: Optional[dict[str, dict[str, float | bool]]],
+    descriptor_focused: bool,
+    visual_boost: float,
+    min_visual_confidence: float,
     topk_docs: int,
 ) -> list[tuple[str, int, float]]:
     candidates: list[tuple[str, int, float]] = []
-    for doc_id, page_summaries in doc_page_summary_index.items():
+    for doc_id, page_indices in doc_page_index.items():
         best_score = 0.0
         best_page_idx = None
-        for page_idx, summary_text in page_summaries:
-            score = _summary_match_score(query, summary_text)
+        for page_idx in page_indices:
+            score, _, _ = _combined_metadata_score(
+                query,
+                _lookup_page_summary(page_summary_map, doc_id, page_idx),
+                _lookup_page_visual_meta(page_visual_meta_map, doc_id, page_idx),
+                descriptor_focused=descriptor_focused,
+                visual_boost=visual_boost,
+                min_confidence=min_visual_confidence,
+            )
             if score > best_score:
                 best_score = score
                 best_page_idx = page_idx
@@ -725,6 +1012,9 @@ def _select_selection_only_pages(
     quota: int,
     descriptor_focused: bool,
     page_summary_map: Optional[dict[str, str]] = None,
+    page_visual_meta_map: Optional[dict[str, dict[str, float | bool]]] = None,
+    visual_boost: float = 2.0,
+    min_visual_confidence: float = 0.4,
 ) -> list[tuple[str, int, float]]:
     if quota <= 0:
         return []
@@ -735,9 +1025,13 @@ def _select_selection_only_pages(
             str(doc_id),
             int(page_idx),
             float(score),
-            _summary_match_score(
+            *_combined_metadata_score(
                 query,
                 _lookup_page_summary(page_summary_map, str(doc_id), int(page_idx)),
+                _lookup_page_visual_meta(page_visual_meta_map, str(doc_id), int(page_idx)),
+                descriptor_focused=descriptor_focused,
+                visual_boost=visual_boost,
+                min_confidence=min_visual_confidence,
             ),
         )
         for rank, (doc_id, page_idx, score) in enumerate(retrieved, start=1)
@@ -749,8 +1043,8 @@ def _select_selection_only_pages(
     picked: list[tuple[str, int, float]] = []
     picked_doc_ids: set[str] = set()
 
-    def add_candidate(candidate: tuple[int, str, int, float, float]) -> bool:
-        _, doc_id, page_idx, score, _ = candidate
+    def add_candidate(candidate: tuple[int, str, int, float, float, float, float]) -> bool:
+        _, doc_id, page_idx, score, _, _, _ = candidate
         if doc_id in selected_doc_ids or doc_id in picked_doc_ids:
             return False
         picked.append((doc_id, page_idx, score))
@@ -762,16 +1056,16 @@ def _select_selection_only_pages(
 
     # Stage-2 summary-aware selection:
     # Use page summaries to pick one extra evidence doc from a bounded window.
-    if quota > 1 and page_summary_map:
+    if quota > 1 and (page_summary_map or page_visual_meta_map):
         rank_window = 64 if descriptor_focused else 40
-        candidates = [c for c in ranked_available if 2 <= c[0] <= rank_window and c[4] > 0]
+        candidates = [c for c in ranked_available if 2 <= c[0] <= rank_window and c[6] > 0]
         if descriptor_focused:
             deeper = [c for c in candidates if 9 <= c[0] <= 24]
             if deeper:
                 candidates = deeper
         if candidates:
-            best_summary = max(candidates, key=lambda c: c[4])[4]
-            best_candidates = [c for c in candidates if c[4] == best_summary]
+            best_summary = max(candidates, key=lambda c: c[6])[6]
+            best_candidates = [c for c in candidates if c[6] == best_summary]
             if descriptor_focused:
                 target_band_rank = 13
                 chosen = min(best_candidates, key=lambda c: abs(c[0] - target_band_rank))
@@ -800,7 +1094,11 @@ def _top_docs_payload_from_pages(
     rows: list[tuple[str, int, float]],
     limit: int,
     page_summary_map: Optional[dict[str, str]] = None,
+    page_visual_meta_map: Optional[dict[str, dict[str, float | bool]]] = None,
     query: Optional[str] = None,
+    descriptor_focused: bool = False,
+    visual_boost: float = 2.0,
+    min_visual_confidence: float = 0.4,
 ) -> list[dict]:
     out: list[dict] = []
     seen: set[str] = set()
@@ -821,6 +1119,25 @@ def _top_docs_payload_from_pages(
             row["page_summary"] = summary_text[:240]
             if query:
                 row["summary_match_score"] = round(_summary_match_score(query, summary_text), 4)
+        visual_meta = _lookup_page_visual_meta(page_visual_meta_map, str(doc_id), int(page_idx))
+        if visual_meta:
+            row["visual_meta"] = {
+                "three_torches_logo_visible": bool(visual_meta.get("three_torches_logo_visible")),
+                "logo_visible": bool(visual_meta.get("logo_visible")),
+                "shield_or_crest_visible": bool(visual_meta.get("shield_or_crest_visible")),
+                "confidence": round(float(visual_meta.get("confidence", 0.0) or 0.0), 4),
+            }
+            if query:
+                row["visual_match_score"] = round(
+                    _visual_match_score(
+                        query,
+                        visual_meta,
+                        descriptor_focused=descriptor_focused,
+                        visual_boost=visual_boost,
+                        min_confidence=min_visual_confidence,
+                    ),
+                    4,
+                )
         out.append(row)
         if len(out) >= limit:
             break
@@ -831,7 +1148,11 @@ def _top_pages_payload_from_pages(
     rows: list[tuple[str, int, float]],
     limit: int,
     page_summary_map: Optional[dict[str, str]] = None,
+    page_visual_meta_map: Optional[dict[str, dict[str, float | bool]]] = None,
     query: Optional[str] = None,
+    descriptor_focused: bool = False,
+    visual_boost: float = 2.0,
+    min_visual_confidence: float = 0.4,
 ) -> list[dict]:
     out: list[dict] = []
     for doc_id, page_idx, score in rows[:limit]:
@@ -845,6 +1166,25 @@ def _top_pages_payload_from_pages(
             row["page_summary"] = summary_text[:240]
             if query:
                 row["summary_match_score"] = round(_summary_match_score(query, summary_text), 4)
+        visual_meta = _lookup_page_visual_meta(page_visual_meta_map, str(doc_id), int(page_idx))
+        if visual_meta:
+            row["visual_meta"] = {
+                "three_torches_logo_visible": bool(visual_meta.get("three_torches_logo_visible")),
+                "logo_visible": bool(visual_meta.get("logo_visible")),
+                "shield_or_crest_visible": bool(visual_meta.get("shield_or_crest_visible")),
+                "confidence": round(float(visual_meta.get("confidence", 0.0) or 0.0), 4),
+            }
+            if query:
+                row["visual_match_score"] = round(
+                    _visual_match_score(
+                        query,
+                        visual_meta,
+                        descriptor_focused=descriptor_focused,
+                        visual_boost=visual_boost,
+                        min_confidence=min_visual_confidence,
+                    ),
+                    4,
+                )
         out.append(row)
     return out
 
@@ -862,6 +1202,9 @@ def run_selection_only_session(
     selection_summary_full_scan: bool = False,
     selection_summary_full_scan_topk: int = 1000,
     page_summary_map: Optional[dict[str, str]] = None,
+    page_visual_meta_map: Optional[dict[str, dict[str, float | bool]]] = None,
+    selection_visual_boost: float = 2.0,
+    selection_visual_min_confidence: float = 0.4,
 ):
     hop_queries, planner_reply = _plan_selection_hop_queries(
         question=question,
@@ -878,11 +1221,13 @@ def run_selection_only_session(
     )
     if page_summary_map:
         logger.info("selection-only summary rerank active: {} page summaries loaded", len(page_summary_map))
-    doc_page_summary_index = _build_doc_page_summary_index(page_summary_map, set(docid2embs.keys()))
-    if selection_summary_full_scan and doc_page_summary_index:
+    if page_visual_meta_map:
+        logger.info("selection-only visual metadata active: {} page entries loaded", len(page_visual_meta_map))
+    doc_page_index = _build_doc_page_index(page_summary_map, page_visual_meta_map, set(docid2embs.keys()))
+    if selection_summary_full_scan and doc_page_index:
         logger.info(
             "selection-only metadata full-scan active: docs_with_summaries={} topk={}",
-            len(doc_page_summary_index),
+            len(doc_page_index),
             selection_summary_full_scan_topk,
         )
 
@@ -919,10 +1264,15 @@ def run_selection_only_session(
             show_progress=False,
         )
         metadata_candidates = []
-        if selection_summary_full_scan and doc_page_summary_index:
+        if selection_summary_full_scan and doc_page_index:
             metadata_candidates = _metadata_full_scan_candidates(
                 query=hop_query,
-                doc_page_summary_index=doc_page_summary_index,
+                doc_page_index=doc_page_index,
+                page_summary_map=page_summary_map,
+                page_visual_meta_map=page_visual_meta_map,
+                descriptor_focused=descriptor_focused,
+                visual_boost=selection_visual_boost,
+                min_visual_confidence=selection_visual_min_confidence,
                 topk_docs=max(selection_summary_full_scan_topk, 0),
             )
         if metadata_candidates:
@@ -935,7 +1285,11 @@ def run_selection_only_session(
             retrieved_for_selection,
             limit=query_retrieval_depth,
             page_summary_map=page_summary_map,
+            page_visual_meta_map=page_visual_meta_map,
             query=hop_query,
+            descriptor_focused=descriptor_focused,
+            visual_boost=selection_visual_boost,
+            min_visual_confidence=selection_visual_min_confidence,
         )
         selected_pages = _select_selection_only_pages(
             query=hop_query,
@@ -944,6 +1298,9 @@ def run_selection_only_session(
             quota=selection_quota,
             descriptor_focused=descriptor_focused,
             page_summary_map=page_summary_map,
+            page_visual_meta_map=page_visual_meta_map,
+            visual_boost=selection_visual_boost,
+            min_visual_confidence=selection_visual_min_confidence,
         )
 
         steps.append(
@@ -965,7 +1322,11 @@ def run_selection_only_session(
                             retrieved_for_selection,
                             limit=query_retrieval_depth,
                             page_summary_map=page_summary_map,
+                            page_visual_meta_map=page_visual_meta_map,
                             query=hop_query,
+                            descriptor_focused=descriptor_focused,
+                            visual_boost=selection_visual_boost,
+                            min_visual_confidence=selection_visual_min_confidence,
                         ),
                         "top_docs": top_docs,
                     }
@@ -987,8 +1348,11 @@ def run_selection_only_session(
                 "retrieval_depth_per_query": base_retrieval_depth,
                 "descriptor_retrieval_depth_per_query": max(base_retrieval_depth * 4, 64),
                 "page_summaries_enabled": bool(page_summary_map),
+                "page_visual_metadata_enabled": bool(page_visual_meta_map),
                 "summary_full_scan": selection_summary_full_scan,
                 "summary_full_scan_topk": selection_summary_full_scan_topk,
+                "selection_visual_boost": selection_visual_boost,
+                "selection_visual_min_confidence": selection_visual_min_confidence,
             },
     }
 
@@ -1417,6 +1781,14 @@ def main():
     if args.page_summaries_file is not None:
         page_summary_map = load_context_map(args.page_summaries_file)
         logger.info("Loaded {} page summaries from {}", len(page_summary_map), args.page_summaries_file)
+    page_visual_meta_map = None
+    if args.page_visual_metadata_file is not None:
+        page_visual_meta_map = load_page_visual_metadata_map(args.page_visual_metadata_file)
+        logger.info(
+            "Loaded {} page visual metadata entries from {}",
+            len(page_visual_meta_map),
+            args.page_visual_metadata_file,
+        )
 
     args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     summary_path = args.summary_json or (args.output_jsonl.parent / f"{args.output_jsonl.stem}_summary.json")
@@ -1515,6 +1887,9 @@ def main():
                         selection_summary_full_scan=args.selection_summary_full_scan,
                         selection_summary_full_scan_topk=args.selection_summary_full_scan_topk,
                         page_summary_map=page_summary_map,
+                        page_visual_meta_map=page_visual_meta_map,
+                        selection_visual_boost=args.selection_visual_boost,
+                        selection_visual_min_confidence=args.selection_visual_min_confidence,
                     )
                 else:
                     candidate_context_fn = make_candidate_context_fn(
@@ -1606,6 +1981,11 @@ def main():
             "selection_summary_full_scan": args.selection_summary_full_scan,
             "selection_summary_full_scan_topk": args.selection_summary_full_scan_topk,
             "page_summaries_file": (str(args.page_summaries_file) if args.page_summaries_file else None),
+            "page_visual_metadata_file": (
+                str(args.page_visual_metadata_file) if args.page_visual_metadata_file else None
+            ),
+            "selection_visual_boost": args.selection_visual_boost,
+            "selection_visual_min_confidence": args.selection_visual_min_confidence,
             "policy_backend": args.policy_backend,
             "policy_model": args.policy_model,
             "policy_device": policy_device,
