@@ -843,28 +843,9 @@ def _visual_match_score(
     visual_boost: float,
     min_confidence: float,
 ) -> float:
-    if not visual_meta:
-        return 0.0
-    confidence = float(visual_meta.get("confidence", 0.0) or 0.0)
-    if confidence < min_confidence:
-        return 0.0
-
-    q = _norm_text(query).casefold()
-    wants_torch = bool(re.search(r"\btorch(?:es)?\b", q))
-    wants_logo = any(tok in q for tok in ("logo", "emblem", "symbol"))
-    wants_shield = any(tok in q for tok in ("shield", "crest", "seal"))
-
-    score = 0.0
-    if wants_torch and bool(visual_meta.get("three_torches_logo_visible")):
-        score += 3.0 * confidence
-    if wants_logo and bool(visual_meta.get("logo_visible")):
-        score += 1.8 * confidence
-    if wants_shield and bool(visual_meta.get("shield_or_crest_visible")):
-        score += 1.8 * confidence
-    if descriptor_focused and score == 0.0:
-        if bool(visual_meta.get("logo_visible")) or bool(visual_meta.get("shield_or_crest_visible")):
-            score += 0.5 * confidence
-    return score * max(visual_boost, 0.0)
+    # Disabled: offline visual metadata has shown low reliability in current experiments.
+    # Keep the plumbing in place so this can be re-enabled later without a large refactor.
+    return 0.0
 
 
 def _combined_metadata_score(
@@ -1127,17 +1108,6 @@ def _top_docs_payload_from_pages(
                 "shield_or_crest_visible": bool(visual_meta.get("shield_or_crest_visible")),
                 "confidence": round(float(visual_meta.get("confidence", 0.0) or 0.0), 4),
             }
-            if query:
-                row["visual_match_score"] = round(
-                    _visual_match_score(
-                        query,
-                        visual_meta,
-                        descriptor_focused=descriptor_focused,
-                        visual_boost=visual_boost,
-                        min_confidence=min_visual_confidence,
-                    ),
-                    4,
-                )
         out.append(row)
         if len(out) >= limit:
             break
@@ -1174,17 +1144,6 @@ def _top_pages_payload_from_pages(
                 "shield_or_crest_visible": bool(visual_meta.get("shield_or_crest_visible")),
                 "confidence": round(float(visual_meta.get("confidence", 0.0) or 0.0), 4),
             }
-            if query:
-                row["visual_match_score"] = round(
-                    _visual_match_score(
-                        query,
-                        visual_meta,
-                        descriptor_focused=descriptor_focused,
-                        visual_boost=visual_boost,
-                        min_confidence=min_visual_confidence,
-                    ),
-                    4,
-                )
         out.append(row)
     return out
 
