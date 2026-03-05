@@ -269,7 +269,8 @@ def build_vqa_model(args) -> VQAModel:
         bits=args.bits,
         attn_implementation=attn_impl,
     )
-    if use_cuda and isinstance(model.model, torch.nn.Module):
+    # 4-bit models are device-dispatched by accelerate/bitsandbytes and must not be moved via .to().
+    if use_cuda and args.bits != 4 and isinstance(model.model, torch.nn.Module):
         model.model = model.model.to(args.device)
     logger.info(
         "Loaded summary model | path={} | type={} | device={} | bits={}",
