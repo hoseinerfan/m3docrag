@@ -25,6 +25,7 @@ GOLD_PAGE_IDX="${GOLD_PAGE_IDX:-0}"
 TOPK_CANDIDATES="${TOPK_CANDIDATES:-1000}"
 SAVE_TOP_K="${SAVE_TOP_K:-1000}"
 RETRIEVAL_RUN_ID="${RETRIEVAL_RUN_ID:-}"
+RERANK_MODE="${RERANK_MODE:-global_page}"
 
 OUTDIR="${OUTDIR:-outputs}"
 OUT_JSON="${OUT_JSON:-$OUTDIR/e783_spatial_reranked.json}"
@@ -92,6 +93,7 @@ conda run -n "$CONDA_ENV" python examples/rerank_topdocs_spatial_coherence.py \
   --retrieval-adapter-model-name-or-path "$ADAPTER" \
   --topk-candidates "$TOPK_CANDIDATES" \
   --save-top-k "$SAVE_TOP_K" \
+  --rerank-mode "$RERANK_MODE" \
   "${EXTRA_ARGS[@]}"
 
 echo "[done] Summary"
