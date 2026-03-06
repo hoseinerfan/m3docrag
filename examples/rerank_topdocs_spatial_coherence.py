@@ -23,6 +23,7 @@ import json
 import math
 import os
 import re
+import statistics
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -227,6 +228,30 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="Optional gold page idx for qid-level before/after rank report.",
+    )
+    p.add_argument(
+        "--qrels-parquet",
+        type=Path,
+        default=None,
+        help="Optional qrels parquet for multi-qid evaluation (gold doc/page targets).",
+    )
+    p.add_argument(
+        "--qrels-qid-col",
+        type=str,
+        default=None,
+        help="Optional qid column override for --qrels-parquet.",
+    )
+    p.add_argument(
+        "--qrels-doc-col",
+        type=str,
+        default=None,
+        help="Optional doc_id column override for --qrels-parquet.",
+    )
+    p.add_argument(
+        "--qrels-page-col",
+        type=str,
+        default=None,
+        help="Optional page column override for --qrels-parquet.",
     )
     p.add_argument(
         "--debug-qid-topn",
@@ -990,15 +1015,119 @@ def _page_features(
     return feats, debug
 
 
+def _gold_rank_multi(
+    rows: list[dict[str, Any]],
+    gold_targets: list[tuple[str, int | None]],
+) -> int | None:
+    if not gold_targets:
+        return None
+    for i, r in enumerate(rows, start=1):
+        d = str(r["doc_id"])
+        p = int(r["page_idx"])
+        for gd, gp in gold_targets:
+            if d != str(gd):
+                continue
+            if gp is None or p == int(gp):
+                return i
+    return None
+
+
 def _gold_rank(rows: list[dict[str, Any]], gold_doc_id: str | None, gold_page_idx: int | None) -> int | None:
     if not gold_doc_id:
         return None
-    for i, r in enumerate(rows, start=1):
-        if str(r["doc_id"]) != str(gold_doc_id):
+    return _gold_rank_multi(rows, [(str(gold_doc_id), None if gold_page_idx is None else int(gold_page_idx))])
+
+
+def _load_qrels_targets_from_parquet(
+    parquet_path: Path | None,
+    qid_col_override: str | None,
+    doc_col_override: str | None,
+    page_col_override: str | None,
+) -> dict[str, list[tuple[str, int | None]]]:
+    if parquet_path is None:
+        return {}
+    try:
+        import pyarrow.dataset as ds
+    except Exception as exc:
+        raise RuntimeError("pyarrow is required to read --qrels-parquet") from exc
+
+    dataset = ds.dataset(str(parquet_path), format="parquet")
+    cols = list(dataset.schema.names)
+    qid_col = _pick_column(cols, qid_col_override, ["qid", "query_id", "question_id"], "qrels qid column")
+    doc_col = _pick_column(
+        cols,
+        doc_col_override,
+        ["doc_id", "document_id", "pid", "page_uid"],
+        "qrels doc_id column",
+    )
+
+    page_col = None
+    if page_col_override:
+        page_col = _pick_column(cols, page_col_override, [page_col_override], "qrels page column")
+    else:
+        for c in ["page_idx", "page_num", "page", "gold_page", "page_id", "maxsim_best_page"]:
+            if c in cols:
+                page_col = c
+                break
+
+    read_cols = [qid_col, doc_col]
+    if page_col:
+        read_cols.append(page_col)
+    table = dataset.to_table(columns=read_cols)
+
+    grouped: dict[str, dict[tuple[str, int | None], None]] = defaultdict(dict)
+    for row in table.to_pylist():
+        qid = row.get(qid_col)
+        doc = _parse_doc_id(row.get(doc_col))
+        if qid is None or doc is None:
             continue
-        if gold_page_idx is None or int(r["page_idx"]) == int(gold_page_idx):
-            return i
-    return None
+        page_val = row.get(page_col) if page_col else None
+        page_idx = _parse_page_idx(page_val) if page_col else None
+        grouped[str(qid)][(str(doc), None if page_idx is None else int(page_idx))] = None
+
+    out: dict[str, list[tuple[str, int | None]]] = {}
+    for qid, kv in grouped.items():
+        out[qid] = list(kv.keys())
+    return out
+
+
+def _summary_from_diagnostics(
+    diagnostics: dict[str, dict[str, Any]],
+    ks: list[int] | None = None,
+) -> dict[str, Any]:
+    if ks is None:
+        ks = [1, 5, 10, 20, 50, 100]
+    rows = [d for d in diagnostics.values() if int(d.get("n_gold_targets", 0)) > 0]
+    n = len(rows)
+    before = [d.get("gold_before_rank") for d in rows]
+    after = [d.get("gold_after_rank") for d in rows]
+    before_num = [int(r) for r in before if r is not None]
+    after_num = [int(r) for r in after if r is not None]
+
+    both = [(int(b), int(a)) for b, a in zip(before, after) if b is not None and a is not None]
+    improved = sum(1 for b, a in both if a < b)
+    worsened = sum(1 for b, a in both if a > b)
+    unchanged = sum(1 for b, a in both if a == b)
+
+    out: dict[str, Any] = {
+        "qids_with_gold_targets": n,
+        "qids_with_before_rank": len(before_num),
+        "qids_with_after_rank": len(after_num),
+        "qids_with_both_ranks": len(both),
+        "improved_count": improved,
+        "worsened_count": worsened,
+        "unchanged_count": unchanged,
+        "avg_before_rank": (sum(before_num) / len(before_num)) if before_num else None,
+        "avg_after_rank": (sum(after_num) / len(after_num)) if after_num else None,
+        "median_before_rank": (float(statistics.median(before_num)) if before_num else None),
+        "median_after_rank": (float(statistics.median(after_num)) if after_num else None),
+        "mrr_before": (sum(1.0 / r for r in before_num) / n) if n else None,
+        "mrr_after": (sum(1.0 / r for r in after_num) / n) if n else None,
+    }
+    for k in ks:
+        out[f"recall@{k}_before"] = (sum(1 for r in before_num if r <= k) / n) if n else None
+        out[f"recall@{k}_after"] = (sum(1 for r in after_num if r <= k) / n) if n else None
+    return out
 
 
 def _select_best_page_per_doc(
@@ -1144,6 +1273,12 @@ def main() -> int:
         )
     qid2query = _load_qid2query(args.mmqa_jsonl)
     idf_map = _load_idf_map(args.idf_json)
+    qid2gold_targets = _load_qrels_targets_from_parquet(
+        parquet_path=args.qrels_parquet,
+        qid_col_override=args.qrels_qid_col,
+        doc_col_override=args.qrels_doc_col,
+        page_col_override=args.qrels_page_col,
+    )
 
     if args.qid is not None:
         if args.qid not in qid2pages:
@@ -1196,6 +1331,16 @@ def main() -> int:
             raise ValueError(
                 f"No query text for qid={qid}. Provide --query with --qid or --mmqa-jsonl."
             )
+        gold_targets: list[tuple[str, int | None]] = []
+        if args.qid == qid and args.gold_doc_id is not None:
+            gold_targets = [
+                (
+                    str(args.gold_doc_id),
+                    None if args.gold_page_idx is None else int(args.gold_page_idx),
+                )
+            ]
+        elif qid in qid2gold_targets:
+            gold_targets = qid2gold_targets[qid]
 
         cands = qid2pages[qid][: args.topk_candidates]
         if not cands:
@@ -1284,12 +1429,16 @@ def main() -> int:
                 docs.append(d)
         reranked_top_docs[qid] = docs
 
-        before_rank = _gold_rank(cands, args.gold_doc_id if args.qid == qid else None, args.gold_page_idx)
-        after_rank = _gold_rank(reranked, args.gold_doc_id if args.qid == qid else None, args.gold_page_idx)
+        before_rank = _gold_rank_multi(cands, gold_targets)
+        after_rank = _gold_rank_multi(reranked, gold_targets)
         diagnostics[qid] = {
             "n_candidates": len(cands),
             "gold_before_rank": before_rank,
             "gold_after_rank": after_rank,
+            "n_gold_targets": len(gold_targets),
+            "gold_targets_preview": [
+                {"doc_id": d, "page_idx": p} for d, p in gold_targets[:5]
+            ],
             "coherence_lambda": args.coherence_lambda,
             "rerank_mode": args.rerank_mode,
         }
@@ -1299,8 +1448,9 @@ def main() -> int:
                 "qid": qid,
                 "query": query,
                 "top_debug_pages": qid_debug_pages,
-                "gold_doc_id": args.gold_doc_id if args.qid == qid else None,
-                "gold_page_idx": args.gold_page_idx if args.qid == qid else None,
+                "gold_targets": [
+                    {"doc_id": d, "page_idx": p} for d, p in gold_targets
+                ],
                 "gold_before_rank": before_rank,
                 "gold_after_rank": after_rank,
             }
@@ -1311,6 +1461,7 @@ def main() -> int:
             "method": "maxsim_spatial_coherence_rerank",
             "source_topdocs_json": None if args.topdocs_json is None else str(args.topdocs_json),
             "source_retrieval_parquet": None if args.retrieval_parquet is None else str(args.retrieval_parquet),
+            "source_qrels_parquet": None if args.qrels_parquet is None else str(args.qrels_parquet),
             "retrieval_run_id": args.retrieval_run_id,
             "topk_candidates": args.topk_candidates,
             "save_top_k": args.save_top_k,
@@ -1328,6 +1479,8 @@ def main() -> int:
         "top_pages": reranked_top_pages,
         "diagnostics": diagnostics,
     }
+    if qid2gold_targets or (args.qid is not None and args.gold_doc_id is not None):
+        out["summary_metrics"] = _summary_from_diagnostics(diagnostics)
 
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     with args.output_json.open("w") as f:
@@ -1343,6 +1496,14 @@ def main() -> int:
         print(
             f"[qid={args.qid}] candidates={d.get('n_candidates')} "
             f"gold_before={d.get('gold_before_rank')} gold_after={d.get('gold_after_rank')}"
+        )
+    if "summary_metrics" in out:
+        sm = out["summary_metrics"]
+        print(
+            "[summary] "
+            f"qids_with_gold={sm.get('qids_with_gold_targets')} "
+            f"recall@10 before={sm.get('recall@10_before')} after={sm.get('recall@10_after')} "
+            f"mrr before={sm.get('mrr_before')} after={sm.get('mrr_after')}"
         )
     print(f"Saved reranked topdocs: {args.output_json}")
     if args.debug_qid_json is not None and debug_payload:
