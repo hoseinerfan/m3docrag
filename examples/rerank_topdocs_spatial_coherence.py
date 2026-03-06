@@ -21,6 +21,7 @@ import argparse
 import datetime as dt
 import json
 import math
+import os
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -375,7 +376,9 @@ def _load_retrieval_parquet(
     filters = []
     if qid_filter:
         filters.append(ds.field(qid_col).isin(list(qid_filter)))
-    if run_id_filter and run_id_col:
+    # Keep run_id filtering in-Python when qid is provided. This avoids brittle
+    # typed comparisons (e.g., int vs str run_id) in pyarrow filter expressions.
+    if run_id_filter and run_id_col and not qid_filter:
         filters.append(ds.field(run_id_col) == run_id_filter)
 
     if filters:
@@ -473,6 +476,31 @@ def _load_retrieval_parquet(
     return out
 
 
+def _parquet_qid_runid_hint(
+    parquet_path: Path,
+    qid: str | None,
+    qid_col_override: str | None,
+) -> tuple[int | None, list[str]]:
+    try:
+        import pyarrow.dataset as ds
+    except Exception:
+        return None, []
+
+    dataset = ds.dataset(str(parquet_path), format="parquet")
+    cols = list(dataset.schema.names)
+    qid_col = _pick_column(cols, qid_col_override, ["qid", "query_id", "question_id"], "qid column")
+    run_id_col = "run_id" if "run_id" in cols else None
+    if run_id_col is None:
+        return None, []
+
+    read_cols = [qid_col, run_id_col]
+    flt = ds.field(qid_col) == str(qid) if qid is not None else None
+    table = dataset.to_table(columns=read_cols, filter=flt)
+    rows = table.to_pylist()
+    run_ids = sorted({str(r.get(run_id_col)) for r in rows if r.get(run_id_col) is not None})
+    return len(rows), run_ids[:20]
+
+
 def _load_qid2query(mmqa_jsonl: Path | None) -> dict[str, str]:
     if mmqa_jsonl is None:
         return {}
@@ -502,6 +530,44 @@ def _resolve_model_path(name_or_path: str) -> str:
     except Exception:
         pass
     return name_or_path
+
+
+def _warn_adapter_backbone_mismatch(
+    backbone_name_or_path: str | None,
+    adapter_name_or_path: str | None,
+) -> None:
+    if not backbone_name_or_path or not adapter_name_or_path:
+        return
+    adapter_path = _resolve_model_path(adapter_name_or_path)
+    cfg_path = Path(adapter_path) / "adapter_config.json"
+    if not cfg_path.exists():
+        return
+
+    try:
+        with cfg_path.open() as f:
+            cfg = json.load(f)
+    except Exception:
+        return
+
+    expected_base = str(cfg.get("base_model_name_or_path") or "").strip()
+    if not expected_base:
+        return
+
+    resolved_backbone = _resolve_model_path(backbone_name_or_path)
+    actual_backbone = str(resolved_backbone or backbone_name_or_path)
+
+    expected_base_name = os.path.basename(expected_base.rstrip("/"))
+    actual_base_name = os.path.basename(actual_backbone.rstrip("/"))
+    if expected_base_name and actual_base_name and expected_base_name == actual_base_name:
+        return
+    if expected_base in actual_backbone:
+        return
+
+    print(
+        "[warn] Possible adapter/backbone mismatch: "
+        f"adapter expects base='{expected_base}', "
+        f"but backbone is '{actual_backbone}'."
+    )
 
 
 def _resolve_dtype(dtype: str) -> torch.dtype:
@@ -1032,7 +1098,22 @@ def main() -> int:
 
     if args.qid is not None:
         if args.qid not in qid2pages:
-            raise KeyError(f"qid={args.qid} not found in topdocs file.")
+            detail = ""
+            if args.retrieval_parquet is not None:
+                detail = f" loaded_qids={len(qid2pages)}"
+                if args.retrieval_run_id is not None:
+                    n_rows, run_ids = _parquet_qid_runid_hint(
+                        parquet_path=args.retrieval_parquet,
+                        qid=args.qid,
+                        qid_col_override=args.retrieval_qid_col,
+                    )
+                    detail += (
+                        f", run_id_filter='{args.retrieval_run_id}'"
+                        f", qid_rows_before_run_filter={n_rows}"
+                    )
+                    if run_ids:
+                        detail += f", sample_run_ids={run_ids}"
+            raise KeyError(f"qid={args.qid} not found in candidates.{detail}")
         qids = [args.qid]
     else:
         qids = sorted(qid2pages.keys())
@@ -1042,6 +1123,11 @@ def main() -> int:
 
     # Lazy import so --self-test remains lightweight.
     from m3docrag.retrieval.colpali import ColPaliRetrievalModel
+
+    _warn_adapter_backbone_mismatch(
+        backbone_name_or_path=args.retrieval_model_name_or_path,
+        adapter_name_or_path=args.retrieval_adapter_model_name_or_path,
+    )
 
     retrieval_model = ColPaliRetrievalModel(
         backbone_name_or_path=_resolve_model_path(args.retrieval_model_name_or_path),
@@ -1173,6 +1259,7 @@ def main() -> int:
             "method": "maxsim_spatial_coherence_rerank",
             "source_topdocs_json": None if args.topdocs_json is None else str(args.topdocs_json),
             "source_retrieval_parquet": None if args.retrieval_parquet is None else str(args.retrieval_parquet),
+            "retrieval_run_id": args.retrieval_run_id,
             "topk_candidates": args.topk_candidates,
             "save_top_k": args.save_top_k,
             "coherence_lambda": args.coherence_lambda,
