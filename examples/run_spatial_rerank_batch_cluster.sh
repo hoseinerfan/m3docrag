@@ -15,6 +15,8 @@ RUN_ID="${RUN_ID:-baseline_ret1000}"
 TOPK_DOCS="${TOPK_DOCS:-1000}"
 PAGES_PER_DOC="${PAGES_PER_DOC:-6}"
 MAX_QIDS="${MAX_QIDS:-100}"
+CANDIDATE_MODE="${CANDIDATE_MODE:-doc_page_pool}" # doc_page_pool | docorder_page0
+FORCE_PAGE_IDX="${FORCE_PAGE_IDX:-0}"             # used when CANDIDATE_MODE=docorder_page0
 
 EMB="${EMB:-/mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali-v1.2_m3-docvqa_dev}"
 MMQA="${MMQA:-/mmfs1/scratch/jacks.local/aerfanshekooh/custom/data/m3-docvqa/multimodalqa/MMQA_dev.jsonl}"
@@ -27,26 +29,53 @@ RERANK_MODE="${RERANK_MODE:-per_doc_page}"
 OUTDIR="${OUTDIR:-outputs/spatial_batch}"
 mkdir -p "$OUTDIR"
 
-TOPDOCS_JSON="${TOPDOCS_JSON:-$OUTDIR/topdocs_doc${TOPK_DOCS}_p${PAGES_PER_DOC}_${RUN_ID}.json}"
-RERANK_JSON="${RERANK_JSON:-$OUTDIR/reranked_doc${TOPK_DOCS}_p${PAGES_PER_DOC}_${RUN_ID}.json}"
-DEBUG_JSON="${DEBUG_JSON:-$OUTDIR/reranked_debug_${RUN_ID}.json}"
+if [[ "$CANDIDATE_MODE" == "docorder_page0" ]]; then
+  TOPDOCS_JSON="${TOPDOCS_JSON:-$OUTDIR/topdocs_doc${TOPK_DOCS}_page${FORCE_PAGE_IDX}_${RUN_ID}.json}"
+  RERANK_JSON="${RERANK_JSON:-$OUTDIR/reranked_doc${TOPK_DOCS}_page${FORCE_PAGE_IDX}_${RUN_ID}.json}"
+  DEBUG_JSON="${DEBUG_JSON:-$OUTDIR/reranked_debug_page${FORCE_PAGE_IDX}_${RUN_ID}.json}"
+else
+  TOPDOCS_JSON="${TOPDOCS_JSON:-$OUTDIR/topdocs_doc${TOPK_DOCS}_p${PAGES_PER_DOC}_${RUN_ID}.json}"
+  RERANK_JSON="${RERANK_JSON:-$OUTDIR/reranked_doc${TOPK_DOCS}_p${PAGES_PER_DOC}_${RUN_ID}.json}"
+  DEBUG_JSON="${DEBUG_JSON:-$OUTDIR/reranked_debug_${RUN_ID}.json}"
+fi
 
 echo "[1/3] Build candidate topdocs pool"
-BUILD_ARGS=(
-  --retrieval-doc-parquet "$DOC_PARQ"
-  --retrieval-page-parquet "$PAGE_PARQ"
-  --output-json "$TOPDOCS_JSON"
-  --run-id "$RUN_ID"
-  --topk-docs "$TOPK_DOCS"
-  --pages-per-doc "$PAGES_PER_DOC"
-)
-if [[ -n "$MAX_QIDS" ]]; then
-  BUILD_ARGS+=(--max-qids "$MAX_QIDS")
+if [[ "$CANDIDATE_MODE" == "doc_page_pool" ]]; then
+  BUILD_ARGS=(
+    --retrieval-doc-parquet "$DOC_PARQ"
+    --retrieval-page-parquet "$PAGE_PARQ"
+    --output-json "$TOPDOCS_JSON"
+    --run-id "$RUN_ID"
+    --topk-docs "$TOPK_DOCS"
+    --pages-per-doc "$PAGES_PER_DOC"
+  )
+  if [[ -n "$MAX_QIDS" ]]; then
+    BUILD_ARGS+=(--max-qids "$MAX_QIDS")
+  fi
+  conda run -n "$CONDA_ENV" python examples/build_topdocs_doc_page_pool.py "${BUILD_ARGS[@]}"
+elif [[ "$CANDIDATE_MODE" == "docorder_page0" ]]; then
+  BUILD_ARGS=(
+    --retrieval-doc-parquet "$DOC_PARQ"
+    --output-json "$TOPDOCS_JSON"
+    --run-id "$RUN_ID"
+    --topk-docs "$TOPK_DOCS"
+    --force-page-idx "$FORCE_PAGE_IDX"
+  )
+  if [[ -n "$MAX_QIDS" ]]; then
+    BUILD_ARGS+=(--max-qids "$MAX_QIDS")
+  fi
+  conda run -n "$CONDA_ENV" python examples/build_topdocs_docorder_page0.py "${BUILD_ARGS[@]}"
+else
+  echo "Unsupported CANDIDATE_MODE='$CANDIDATE_MODE'. Use 'doc_page_pool' or 'docorder_page0'." >&2
+  exit 1
 fi
-conda run -n "$CONDA_ENV" python examples/build_topdocs_doc_page_pool.py "${BUILD_ARGS[@]}"
 
 echo "[2/3] Rerank and evaluate against qrels"
-TOPK_CANDIDATES=$((TOPK_DOCS * PAGES_PER_DOC + TOPK_DOCS))
+if [[ "$CANDIDATE_MODE" == "docorder_page0" ]]; then
+  TOPK_CANDIDATES="$TOPK_DOCS"
+else
+  TOPK_CANDIDATES=$((TOPK_DOCS * PAGES_PER_DOC + TOPK_DOCS))
+fi
 RERANK_ARGS=(
   --topdocs-json "$TOPDOCS_JSON"
   --qrels-parquet "$QRELS_PARQ"
