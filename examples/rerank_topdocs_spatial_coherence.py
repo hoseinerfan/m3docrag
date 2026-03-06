@@ -103,6 +103,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--retrieval-doc-col", type=str, default=None, help="Optional parquet doc_id column override.")
     p.add_argument("--retrieval-page-col", type=str, default=None, help="Optional parquet page_idx column override.")
     p.add_argument(
+        "--retrieval-run-id",
+        type=str,
+        default=None,
+        help="Optional run_id filter when parquet includes multiple runs.",
+    )
+    p.add_argument(
         "--retrieval-score-col",
         type=str,
         default=None,
@@ -296,6 +302,7 @@ def _parse_doc_id(value: Any) -> str | None:
 def _load_retrieval_parquet(
     parquet_path: Path,
     qid_filter: set[str] | None,
+    run_id_filter: str | None,
     qid_col_override: str | None,
     doc_col_override: str | None,
     page_col_override: str | None,
@@ -309,6 +316,7 @@ def _load_retrieval_parquet(
 
     dataset = ds.dataset(str(parquet_path), format="parquet")
     cols = list(dataset.schema.names)
+    run_id_col = "run_id" if "run_id" in cols else None
 
     qid_col = _pick_column(cols, qid_col_override, ["qid", "query_id", "question_id"], "qid column")
     doc_col = _pick_column(
@@ -354,6 +362,8 @@ def _load_retrieval_parquet(
                 break
 
     read_cols = [qid_col, doc_col, page_col]
+    if run_id_col:
+        read_cols.append(run_id_col)
     if page_uid_col and page_uid_col not in read_cols:
         read_cols.append(page_uid_col)
     if score_col:
@@ -362,17 +372,29 @@ def _load_retrieval_parquet(
         read_cols.append(rank_col)
 
     table = None
+    filters = []
     if qid_filter:
+        filters.append(ds.field(qid_col).isin(list(qid_filter)))
+    if run_id_filter and run_id_col:
+        filters.append(ds.field(run_id_col) == run_id_filter)
+
+    if filters:
+        flt = filters[0]
+        for f in filters[1:]:
+            flt = flt & f
         try:
-            table = dataset.to_table(columns=read_cols, filter=ds.field(qid_col).isin(list(qid_filter)))
+            table = dataset.to_table(columns=read_cols, filter=flt)
         except Exception:
             table = dataset.to_table(columns=read_cols)
     else:
         table = dataset.to_table(columns=read_cols)
 
-    grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    dedup: dict[str, dict[tuple[str, int], dict[str, Any]]] = defaultdict(dict)
     for row in table.to_pylist():
         qid = row.get(qid_col)
+        run_id_val = row.get(run_id_col) if run_id_col else None
+        if run_id_filter and run_id_col and str(run_id_val) != str(run_id_filter):
+            continue
         raw_doc = row.get(doc_col)
         raw_page = row.get(page_col)
         raw_page_uid = row.get(page_uid_col) if page_uid_col else None
@@ -402,17 +424,36 @@ def _load_retrieval_parquet(
                     score = -float(rank)
                 except Exception:
                     score = 0.0
-        grouped[qid].append(
-            {
-                "doc_id": str(doc_id),
-                "page_idx": int(page_idx),
-                "score": float(score),
-                "_rank": None if rank is None else rank,
-            }
-        )
+        key = (str(doc_id), int(page_idx))
+        rec = {
+            "doc_id": str(doc_id),
+            "page_idx": int(page_idx),
+            "score": float(score),
+            "_rank": None if rank is None else rank,
+            "_run_id": None if run_id_val is None else str(run_id_val),
+        }
+        prev = dedup[qid].get(key)
+        if prev is None:
+            dedup[qid][key] = rec
+        else:
+            prev_r = prev.get("_rank")
+            cur_r = rec.get("_rank")
+            choose_cur = False
+            if prev_r is None and cur_r is not None:
+                choose_cur = True
+            elif prev_r is not None and cur_r is not None:
+                try:
+                    choose_cur = float(cur_r) < float(prev_r)
+                except Exception:
+                    choose_cur = float(rec["score"]) > float(prev["score"])
+            else:
+                choose_cur = float(rec["score"]) > float(prev["score"])
+            if choose_cur:
+                dedup[qid][key] = rec
 
     out: dict[str, list[dict[str, Any]]] = {}
-    for qid, rows in grouped.items():
+    for qid, recs in dedup.items():
+        rows = list(recs.values())
         has_rank = any(r.get("_rank") is not None for r in rows)
         if has_rank:
             def rank_key(r: dict[str, Any]) -> tuple[float, float]:
@@ -427,6 +468,7 @@ def _load_retrieval_parquet(
             rows = sorted(rows, key=lambda x: float(x["score"]), reverse=True)
         for r in rows:
             r.pop("_rank", None)
+            r.pop("_run_id", None)
         out[qid] = rows
     return out
 
@@ -978,6 +1020,7 @@ def main() -> int:
         qid2pages = _load_retrieval_parquet(
             parquet_path=args.retrieval_parquet,
             qid_filter=qid_filter,
+            run_id_filter=args.retrieval_run_id,
             qid_col_override=args.retrieval_qid_col,
             doc_col_override=args.retrieval_doc_col,
             page_col_override=args.retrieval_page_col,

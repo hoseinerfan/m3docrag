@@ -24,6 +24,7 @@ GOLD_PAGE_IDX="${GOLD_PAGE_IDX:-0}"
 
 TOPK_CANDIDATES="${TOPK_CANDIDATES:-1000}"
 SAVE_TOP_K="${SAVE_TOP_K:-1000}"
+RETRIEVAL_RUN_ID="${RETRIEVAL_RUN_ID:-}"
 
 OUTDIR="${OUTDIR:-outputs}"
 OUT_JSON="${OUT_JSON:-$OUTDIR/e783_spatial_reranked.json}"
@@ -72,6 +73,11 @@ print("sample:", d.to_table(columns=d.schema.names[:min(8, len(d.schema.names))]
 PY
 
 echo "[4/4] Running spatial reranker"
+EXTRA_ARGS=()
+if [[ -n "$RETRIEVAL_RUN_ID" ]]; then
+  EXTRA_ARGS+=(--retrieval-run-id "$RETRIEVAL_RUN_ID")
+fi
+
 conda run -n "$CONDA_ENV" python examples/rerank_topdocs_spatial_coherence.py \
   --retrieval-parquet "$PARQ" \
   --output-json "$OUT_JSON" \
@@ -85,7 +91,8 @@ conda run -n "$CONDA_ENV" python examples/rerank_topdocs_spatial_coherence.py \
   --retrieval-model-name-or-path "$BACKBONE" \
   --retrieval-adapter-model-name-or-path "$ADAPTER" \
   --topk-candidates "$TOPK_CANDIDATES" \
-  --save-top-k "$SAVE_TOP_K"
+  --save-top-k "$SAVE_TOP_K" \
+  "${EXTRA_ARGS[@]}"
 
 echo "[done] Summary"
 export OUT_JSON QID
