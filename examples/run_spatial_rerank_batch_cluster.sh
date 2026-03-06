@@ -14,7 +14,8 @@ QRELS_PARQ="${QRELS_PARQ:-$DATASET_ROOT/parquet/qrels.parquet}"
 RUN_ID="${RUN_ID:-baseline_ret1000}"
 TOPK_DOCS="${TOPK_DOCS:-1000}"
 PAGES_PER_DOC="${PAGES_PER_DOC:-6}"
-MAX_QIDS="${MAX_QIDS:-100}"
+# Leave empty (or set to "all") to process every qid.
+MAX_QIDS="${MAX_QIDS:-}"
 CANDIDATE_MODE="${CANDIDATE_MODE:-doc_page_pool}" # doc_page_pool | docorder_page0
 FORCE_PAGE_IDX="${FORCE_PAGE_IDX:-0}"             # used when CANDIDATE_MODE=docorder_page0
 
@@ -49,7 +50,7 @@ if [[ "$CANDIDATE_MODE" == "doc_page_pool" ]]; then
     --topk-docs "$TOPK_DOCS"
     --pages-per-doc "$PAGES_PER_DOC"
   )
-  if [[ -n "$MAX_QIDS" ]]; then
+  if [[ -n "$MAX_QIDS" && "$MAX_QIDS" != "all" ]]; then
     BUILD_ARGS+=(--max-qids "$MAX_QIDS")
   fi
   conda run -n "$CONDA_ENV" python examples/build_topdocs_doc_page_pool.py "${BUILD_ARGS[@]}"
@@ -61,7 +62,7 @@ elif [[ "$CANDIDATE_MODE" == "docorder_page0" ]]; then
     --topk-docs "$TOPK_DOCS"
     --force-page-idx "$FORCE_PAGE_IDX"
   )
-  if [[ -n "$MAX_QIDS" ]]; then
+  if [[ -n "$MAX_QIDS" && "$MAX_QIDS" != "all" ]]; then
     BUILD_ARGS+=(--max-qids "$MAX_QIDS")
   fi
   conda run -n "$CONDA_ENV" python examples/build_topdocs_docorder_page0.py "${BUILD_ARGS[@]}"
