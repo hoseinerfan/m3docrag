@@ -279,6 +279,20 @@ def _parse_page_idx(value: Any) -> int | None:
     return None
 
 
+def _parse_doc_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if "_page" in s:
+        return s.split("_page", 1)[0]
+    m = re.match(r"(.+?)[\s:/#-]*p(?:age)?[_-]?(\d+)$", s, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return s
+
+
 def _load_retrieval_parquet(
     parquet_path: Path,
     qid_filter: set[str] | None,
@@ -297,7 +311,13 @@ def _load_retrieval_parquet(
     cols = list(dataset.schema.names)
 
     qid_col = _pick_column(cols, qid_col_override, ["qid", "query_id", "question_id"], "qid column")
-    doc_col = _pick_column(cols, doc_col_override, ["doc_id", "document_id"], "doc_id column")
+    doc_col = _pick_column(
+        cols,
+        doc_col_override,
+        ["doc_id", "document_id", "page_uid", "pid"],
+        "doc_id column",
+    )
+    page_uid_col = "page_uid" if "page_uid" in cols else None
     page_col = _pick_column(
         cols,
         page_col_override,
@@ -328,12 +348,14 @@ def _load_retrieval_parquet(
     if rank_col_override:
         rank_col = _pick_column(cols, rank_col_override, [rank_col_override], "rank column")
     else:
-        for c in ["rank", "retrieval_rank", "source_rank", "maxsim_rank", "faiss_rank"]:
+        for c in ["rank", "retrieval_rank", "source_rank", "page_rank", "maxsim_rank", "faiss_rank"]:
             if c in cols:
                 rank_col = c
                 break
 
     read_cols = [qid_col, doc_col, page_col]
+    if page_uid_col and page_uid_col not in read_cols:
+        read_cols.append(page_uid_col)
     if score_col:
         read_cols.append(score_col)
     if rank_col:
@@ -351,8 +373,20 @@ def _load_retrieval_parquet(
     grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in table.to_pylist():
         qid = row.get(qid_col)
-        doc_id = row.get(doc_col)
-        page_idx = _parse_page_idx(row.get(page_col))
+        raw_doc = row.get(doc_col)
+        raw_page = row.get(page_col)
+        raw_page_uid = row.get(page_uid_col) if page_uid_col else None
+
+        doc_id = _parse_doc_id(raw_doc)
+        page_idx = _parse_page_idx(raw_page)
+
+        if doc_id is None and raw_page_uid is not None:
+            doc_id = _parse_doc_id(raw_page_uid)
+        if page_idx is None and raw_page_uid is not None:
+            page_idx = _parse_page_idx(raw_page_uid)
+        if page_idx is None and raw_doc is not None:
+            page_idx = _parse_page_idx(raw_doc)
+
         if qid is None or doc_id is None or page_idx is None:
             continue
         qid = str(qid)
