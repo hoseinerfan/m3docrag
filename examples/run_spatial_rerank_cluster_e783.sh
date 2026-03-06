@@ -9,7 +9,7 @@ cd "$PROJECT_ROOT"
 
 CONDA_ENV="${CONDA_ENV:-my_cuda_env}"
 
-ROOT="${ROOT:-/mmfs1/scratch/jacks.local/aerfanshekooh/custom/datasets/m3docvqa_dev_ret1000_rerankexp_v1}"
+DATASET_ROOT="${DATASET_ROOT:-/mmfs1/scratch/jacks.local/aerfanshekooh/custom/datasets/m3docvqa_dev_ret1000_rerankexp_v1}"
 PARQ="${PARQ:-}"
 
 EMB="${EMB:-/mmfs1/scratch/jacks.local/aerfanshekooh/custom/embeddings/colpali-v1.2_m3-docvqa_dev}"
@@ -36,18 +36,20 @@ fi
 
 mkdir -p "$OUTDIR"
 
-echo "[1/4] Discovering parquet under ROOT=$ROOT"
-find "$ROOT" -maxdepth 8 \( -type d -name "retrieval_edges*" -o -type f -name "*.parquet" \) | sort | head -n 200 || true
+echo "[1/4] Discovering parquet under DATASET_ROOT=$DATASET_ROOT"
+find "$DATASET_ROOT" -maxdepth 8 \( -type d -name "retrieval_edges*" -o -type f -name "*.parquet" \) | sort | head -n 200 || true
 
 if [[ -z "$PARQ" ]]; then
-  if [[ -d "$ROOT/parquet/retrieval_edges" ]]; then
-    PARQ="$ROOT/parquet/retrieval_edges"
-  elif [[ -f "$ROOT/parquet/retrieval_edges.parquet" ]]; then
-    PARQ="$ROOT/parquet/retrieval_edges.parquet"
-  elif [[ -d "$ROOT/parquet" ]]; then
-    PARQ="$ROOT/parquet"
+  if [[ -f "$DATASET_ROOT/parquet/retrieval_page_edges.parquet" ]]; then
+    PARQ="$DATASET_ROOT/parquet/retrieval_page_edges.parquet"
+  elif [[ -d "$DATASET_ROOT/parquet/retrieval_edges" ]]; then
+    PARQ="$DATASET_ROOT/parquet/retrieval_edges"
+  elif [[ -f "$DATASET_ROOT/parquet/retrieval_edges.parquet" ]]; then
+    PARQ="$DATASET_ROOT/parquet/retrieval_edges.parquet"
+  elif [[ -d "$DATASET_ROOT/parquet" ]]; then
+    PARQ="$DATASET_ROOT/parquet"
   else
-    PARQ="$(find "$ROOT" -maxdepth 8 -type f -name '*.parquet' | head -n 1 || true)"
+    PARQ="$(find "$DATASET_ROOT" -maxdepth 8 -type f -name '*.parquet' | head -n 1 || true)"
   fi
 fi
 

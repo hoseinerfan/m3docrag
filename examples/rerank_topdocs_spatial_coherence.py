@@ -260,6 +260,25 @@ def _pick_column(cols: list[str], override: str | None, candidates: list[str], n
     raise ValueError(f"Could not infer {name}. Available cols: {cols}")
 
 
+def _parse_page_idx(value: Any) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except Exception:
+        pass
+    s = str(value).strip()
+    if not s:
+        return None
+    m = re.search(r"(\d+)\s*$", s)
+    if m:
+        try:
+            return int(m.group(1))
+        except Exception:
+            return None
+    return None
+
+
 def _load_retrieval_parquet(
     parquet_path: Path,
     qid_filter: set[str] | None,
@@ -279,13 +298,28 @@ def _load_retrieval_parquet(
 
     qid_col = _pick_column(cols, qid_col_override, ["qid", "query_id", "question_id"], "qid column")
     doc_col = _pick_column(cols, doc_col_override, ["doc_id", "document_id"], "doc_id column")
-    page_col = _pick_column(cols, page_col_override, ["page_idx", "page_id", "page"], "page_idx column")
+    page_col = _pick_column(
+        cols,
+        page_col_override,
+        [
+            "page_idx",
+            "page_id",
+            "page",
+            "maxsim_best_page",
+            "best_page",
+            "best_page_idx",
+            "retrieved_page",
+            "page_no",
+            "page_num",
+        ],
+        "page_idx column",
+    )
 
     score_col = None
     if score_col_override:
         score_col = _pick_column(cols, score_col_override, [score_col_override], "score column")
     else:
-        for c in ["score", "sim", "similarity", "maxsim_score"]:
+        for c in ["score", "sim", "similarity", "maxsim_score", "faiss_score"]:
             if c in cols:
                 score_col = c
                 break
@@ -294,7 +328,7 @@ def _load_retrieval_parquet(
     if rank_col_override:
         rank_col = _pick_column(cols, rank_col_override, [rank_col_override], "rank column")
     else:
-        for c in ["rank", "retrieval_rank", "source_rank"]:
+        for c in ["rank", "retrieval_rank", "source_rank", "maxsim_rank", "faiss_rank"]:
             if c in cols:
                 rank_col = c
                 break
@@ -318,7 +352,7 @@ def _load_retrieval_parquet(
     for row in table.to_pylist():
         qid = row.get(qid_col)
         doc_id = row.get(doc_col)
-        page_idx = row.get(page_col)
+        page_idx = _parse_page_idx(row.get(page_col))
         if qid is None or doc_id is None or page_idx is None:
             continue
         qid = str(qid)
