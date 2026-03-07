@@ -187,10 +187,11 @@ def _parse_args() -> argparse.Namespace:
         "--rerank-mode",
         type=str,
         default="global_page",
-        choices=["global_page", "per_doc_page"],
+        choices=["global_page", "per_doc_page", "per_doc_reorder"],
         help=(
             "global_page: rerank all page candidates globally; "
-            "per_doc_page: pick best page within each doc and preserve original doc order."
+            "per_doc_page: pick best page within each doc and preserve original doc order; "
+            "per_doc_reorder: pick best page within each doc then reorder docs by rerank score."
         ),
     )
     p.add_argument(
@@ -1038,6 +1039,47 @@ def _gold_rank(rows: list[dict[str, Any]], gold_doc_id: str | None, gold_page_id
     return _gold_rank_multi(rows, [(str(gold_doc_id), None if gold_page_idx is None else int(gold_page_idx))])
 
 
+def _doc_rank_multi_from_page_rows(
+    rows: list[dict[str, Any]],
+    gold_targets: list[tuple[str, int | None]],
+) -> int | None:
+    if not gold_targets:
+        return None
+    gold_docs = {str(gd) for gd, _ in gold_targets}
+    if not gold_docs:
+        return None
+    seen: set[str] = set()
+    rank = 0
+    for r in rows:
+        d = str(r["doc_id"])
+        if d in seen:
+            continue
+        seen.add(d)
+        rank += 1
+        if d in gold_docs:
+            return rank
+    return None
+
+
+def _doc_rank_multi_from_doc_rows(
+    doc_ids: list[str],
+    gold_targets: list[tuple[str, int | None]],
+) -> int | None:
+    if not gold_targets:
+        return None
+    gold_docs = {str(gd) for gd, _ in gold_targets}
+    if not gold_docs:
+        return None
+    for i, d in enumerate(doc_ids, start=1):
+        if str(d) in gold_docs:
+            return i
+    return None
+
+
+def _has_any_page_labeled_target(gold_targets: list[tuple[str, int | None]]) -> bool:
+    return any(gp is not None for _, gp in gold_targets)
+
+
 def _load_qrels_targets_from_parquet(
     parquet_path: Path | None,
     qid_col_override: str | None,
@@ -1167,6 +1209,23 @@ def _select_best_page_per_doc(
         chosen.append(rec)
 
     return chosen
+
+
+def _rerank_pages_globally(
+    rows: list[dict[str, Any]],
+    coherence_lambda: float,
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    base_z = _zscore([float(r["base_score"]) for r in rows])
+    coh_z = _zscore([float(r["coherence"]) for r in rows])
+    out: list[dict[str, Any]] = []
+    for i, r in enumerate(rows):
+        rec = r.copy()
+        rec["final_score"] = float(base_z[i] + coherence_lambda * coh_z[i])
+        out.append(rec)
+    out.sort(key=lambda x: x["final_score"], reverse=True)
+    return out
 
 
 def _run_self_test() -> int:
@@ -1401,12 +1460,11 @@ def main() -> int:
 
         if args.rerank_mode == "per_doc_page":
             reranked = _select_best_page_per_doc(rows, coherence_lambda=args.coherence_lambda)
+        elif args.rerank_mode == "per_doc_reorder":
+            chosen = _select_best_page_per_doc(rows, coherence_lambda=args.coherence_lambda)
+            reranked = _rerank_pages_globally(chosen, coherence_lambda=args.coherence_lambda)
         else:
-            base_z = _zscore([r["base_score"] for r in rows])
-            coh_z = _zscore([r["coherence"] for r in rows])
-            for i, r in enumerate(rows):
-                r["final_score"] = float(base_z[i] + args.coherence_lambda * coh_z[i])
-            reranked = sorted(rows, key=lambda x: x["final_score"], reverse=True)
+            reranked = _rerank_pages_globally(rows, coherence_lambda=args.coherence_lambda)
         save_rows = reranked[: args.save_top_k]
         reranked_top_pages[qid] = [
             {
@@ -1429,8 +1487,13 @@ def main() -> int:
                 docs.append(d)
         reranked_top_docs[qid] = docs
 
-        before_rank = _gold_rank_multi(cands, gold_targets)
-        after_rank = _gold_rank_multi(reranked, gold_targets)
+        eval_granularity = "page" if _has_any_page_labeled_target(gold_targets) else "doc"
+        if eval_granularity == "page":
+            before_rank = _gold_rank_multi(cands, gold_targets)
+            after_rank = _gold_rank_multi(reranked, gold_targets)
+        else:
+            before_rank = _doc_rank_multi_from_page_rows(cands, gold_targets)
+            after_rank = _doc_rank_multi_from_doc_rows(reranked_top_docs[qid], gold_targets)
         diagnostics[qid] = {
             "n_candidates": len(cands),
             "gold_before_rank": before_rank,
@@ -1441,6 +1504,7 @@ def main() -> int:
             ],
             "coherence_lambda": args.coherence_lambda,
             "rerank_mode": args.rerank_mode,
+            "eval_granularity": eval_granularity,
         }
 
         if qid_debug_pages:
