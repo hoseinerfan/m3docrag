@@ -15,6 +15,7 @@ RUN_ID="${RUN_ID:-baseline_ret1000}"
 TOPK_DOCS="${TOPK_DOCS:-1000}"
 # Leave empty (or "all") to process all qids.
 MAX_QIDS="${MAX_QIDS:-all}"
+QIDS_FILE="${QIDS_FILE:-}"
 
 # Keep retrieval_edges ordering from this rank column.
 DOC_RANK_COL="${DOC_RANK_COL:-faiss_rank}"
@@ -27,10 +28,16 @@ ADAPTER="${ADAPTER:-/mmfs1/scratch/jacks.local/aerfanshekooh/custom/models/colpa
 
 COHERENCE_LAMBDA="${COHERENCE_LAMBDA:-0.15}"
 RERANK_MODE="${RERANK_MODE:-per_doc_reorder}"
+SCORE_MODE="${SCORE_MODE:-base_plus_coherence}"
 SUMMARY_KS="${SUMMARY_KS:-1,2,4,10,50,100,500}"
 
 OUTDIR="${OUTDIR:-outputs/spatial_batch_allpages}"
 mkdir -p "$OUTDIR"
+
+echo "RUN_ID=$RUN_ID TOPK_DOCS=$TOPK_DOCS MAX_QIDS=$MAX_QIDS"
+echo "DOC_RANK_COL=$DOC_RANK_COL DOC_SCORE_COL=$DOC_SCORE_COL"
+echo "RERANK_MODE=$RERANK_MODE SCORE_MODE=$SCORE_MODE COHERENCE_LAMBDA=$COHERENCE_LAMBDA"
+echo "QIDS_FILE=${QIDS_FILE:-<none>}"
 
 TOPDOCS_JSON="${TOPDOCS_JSON:-$OUTDIR/topdocs_doc${TOPK_DOCS}_allpages_${RUN_ID}.json}"
 RERANK_JSON="${RERANK_JSON:-$OUTDIR/reranked_doc${TOPK_DOCS}_allpages_${RUN_ID}.json}"
@@ -49,6 +56,9 @@ BUILD_ARGS=(
 )
 if [[ -n "$MAX_QIDS" && "$MAX_QIDS" != "all" ]]; then
   BUILD_ARGS+=(--max-qids "$MAX_QIDS")
+fi
+if [[ -n "$QIDS_FILE" ]]; then
+  BUILD_ARGS+=(--qids-file "$QIDS_FILE")
 fi
 conda run -n "$CONDA_ENV" python examples/build_topdocs_doc_page_pool.py "${BUILD_ARGS[@]}"
 
@@ -103,6 +113,7 @@ RERANK_ARGS=(
   --topk-candidates "$TOPK_CANDIDATES"
   --save-top-k "$TOPK_DOCS"
   --coherence-lambda "$COHERENCE_LAMBDA"
+  --score-mode "$SCORE_MODE"
   --rerank-mode "$RERANK_MODE"
   --summary-ks "$SUMMARY_KS"
 )

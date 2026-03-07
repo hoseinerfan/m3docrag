@@ -184,6 +184,17 @@ def _parse_args() -> argparse.Namespace:
         help="Final score = z(base) + lambda * z(coherence).",
     )
     p.add_argument(
+        "--score-mode",
+        type=str,
+        default="base_plus_coherence",
+        choices=["base_plus_coherence", "coherence_only", "density_only", "base_only"],
+        help=(
+            "How to form rerank score: "
+            "base_plus_coherence=z(base)+lambda*z(coherence), "
+            "coherence_only=z(coherence), density_only=z(cluster_mass), base_only=z(base)."
+        ),
+    )
+    p.add_argument(
         "--rerank-mode",
         type=str,
         default="global_page",
@@ -1201,6 +1212,7 @@ def _parse_summary_ks(ks_text: str) -> list[int]:
 def _select_best_page_per_doc(
     rows: list[dict[str, Any]],
     coherence_lambda: float,
+    score_mode: str,
 ) -> list[dict[str, Any]]:
     doc2rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
     doc_order: list[str] = []
@@ -1217,16 +1229,34 @@ def _select_best_page_per_doc(
         pages = doc2rows[d]
         if len(pages) == 1:
             rec = pages[0].copy()
-            rec["final_score"] = float(rec["base_score"])
+            rec["final_score"] = _final_score(
+                base_z=0.0,
+                coh_z=0.0,
+                dens_z=0.0,
+                coherence_lambda=coherence_lambda,
+                score_mode=score_mode,
+            )
             chosen.append(rec)
             continue
 
         base_z = _zscore([float(r["base_score"]) for r in pages])
         coh_z = _zscore([float(r["coherence"]) for r in pages])
+        dens_z = _zscore(
+            [
+                float((r.get("features") or {}).get("cluster_mass", 0.0))
+                for r in pages
+            ]
+        )
         best_i = 0
         best_s = float("-inf")
         for i in range(len(pages)):
-            s = float(base_z[i] + coherence_lambda * coh_z[i])
+            s = _final_score(
+                base_z=base_z[i],
+                coh_z=coh_z[i],
+                dens_z=dens_z[i],
+                coherence_lambda=coherence_lambda,
+                score_mode=score_mode,
+            )
             if s > best_s:
                 best_s = s
                 best_i = i
@@ -1240,18 +1270,49 @@ def _select_best_page_per_doc(
 def _rerank_pages_globally(
     rows: list[dict[str, Any]],
     coherence_lambda: float,
+    score_mode: str,
 ) -> list[dict[str, Any]]:
     if not rows:
         return []
     base_z = _zscore([float(r["base_score"]) for r in rows])
     coh_z = _zscore([float(r["coherence"]) for r in rows])
+    dens_z = _zscore(
+        [
+            float((r.get("features") or {}).get("cluster_mass", 0.0))
+            for r in rows
+        ]
+    )
     out: list[dict[str, Any]] = []
     for i, r in enumerate(rows):
         rec = r.copy()
-        rec["final_score"] = float(base_z[i] + coherence_lambda * coh_z[i])
+        rec["final_score"] = _final_score(
+            base_z=base_z[i],
+            coh_z=coh_z[i],
+            dens_z=dens_z[i],
+            coherence_lambda=coherence_lambda,
+            score_mode=score_mode,
+        )
         out.append(rec)
     out.sort(key=lambda x: x["final_score"], reverse=True)
     return out
+
+
+def _final_score(
+    base_z: float,
+    coh_z: float,
+    dens_z: float,
+    coherence_lambda: float,
+    score_mode: str,
+) -> float:
+    if score_mode == "base_plus_coherence":
+        return float(base_z + coherence_lambda * coh_z)
+    if score_mode == "coherence_only":
+        return float(coh_z)
+    if score_mode == "density_only":
+        return float(dens_z)
+    if score_mode == "base_only":
+        return float(base_z)
+    raise ValueError(f"Unsupported score_mode={score_mode}")
 
 
 def _run_self_test() -> int:
@@ -1486,12 +1547,28 @@ def main() -> int:
                 )
 
         if args.rerank_mode == "per_doc_page":
-            reranked = _select_best_page_per_doc(rows, coherence_lambda=args.coherence_lambda)
+            reranked = _select_best_page_per_doc(
+                rows,
+                coherence_lambda=args.coherence_lambda,
+                score_mode=args.score_mode,
+            )
         elif args.rerank_mode == "per_doc_reorder":
-            chosen = _select_best_page_per_doc(rows, coherence_lambda=args.coherence_lambda)
-            reranked = _rerank_pages_globally(chosen, coherence_lambda=args.coherence_lambda)
+            chosen = _select_best_page_per_doc(
+                rows,
+                coherence_lambda=args.coherence_lambda,
+                score_mode=args.score_mode,
+            )
+            reranked = _rerank_pages_globally(
+                chosen,
+                coherence_lambda=args.coherence_lambda,
+                score_mode=args.score_mode,
+            )
         else:
-            reranked = _rerank_pages_globally(rows, coherence_lambda=args.coherence_lambda)
+            reranked = _rerank_pages_globally(
+                rows,
+                coherence_lambda=args.coherence_lambda,
+                score_mode=args.score_mode,
+            )
         save_rows = reranked[: args.save_top_k]
         reranked_top_pages[qid] = [
             {
@@ -1530,6 +1607,7 @@ def main() -> int:
                 {"doc_id": d, "page_idx": p} for d, p in gold_targets[:5]
             ],
             "coherence_lambda": args.coherence_lambda,
+            "score_mode": args.score_mode,
             "rerank_mode": args.rerank_mode,
             "eval_granularity": eval_granularity,
         }
@@ -1557,6 +1635,7 @@ def main() -> int:
             "topk_candidates": args.topk_candidates,
             "save_top_k": args.save_top_k,
             "coherence_lambda": args.coherence_lambda,
+            "score_mode": args.score_mode,
             "rerank_mode": args.rerank_mode,
             "cluster_radius": args.cluster_radius,
             "spatial_token_offset": args.spatial_token_offset,
