@@ -54,17 +54,39 @@ conda run -n "$CONDA_ENV" python examples/build_topdocs_doc_page_pool.py "${BUIL
 
 echo "[2/4] Compute topk-candidates from built pool"
 if [[ -z "${TOPK_CANDIDATES:-}" || "${TOPK_CANDIDATES}" == "auto" ]]; then
-  TOPK_CANDIDATES="$(TOPDOCS_JSON="$TOPDOCS_JSON" conda run -n "$CONDA_ENV" python - <<'PY'
-import json, os
-p = os.environ["TOPDOCS_JSON"]
-j = json.load(open(p))
+  if command -v python3 >/dev/null 2>&1; then
+    PY_BIN="python3"
+  else
+    PY_BIN="python"
+  fi
+  TOPK_CANDIDATES="$("$PY_BIN" - <<'PY'
+import json
+import os
+import re
+import sys
+
+p = os.environ.get("TOPDOCS_JSON")
+if not p:
+    print("")
+    raise SystemExit(0)
+try:
+    j = json.load(open(p))
+except Exception:
+    print("")
+    raise SystemExit(0)
 mx = 0
 for rows in j.get("top_pages", {}).values():
     if isinstance(rows, list):
         mx = max(mx, len(rows))
 print(mx)
 PY
-  )"
+)"
+  # Guard against whitespace/non-numeric output edge cases.
+  TOPK_CANDIDATES="$(printf '%s' "$TOPK_CANDIDATES" | tr -dc '0-9')"
+fi
+if [[ -z "$TOPK_CANDIDATES" ]]; then
+  echo "Failed to infer TOPK_CANDIDATES from $TOPDOCS_JSON. Set TOPK_CANDIDATES explicitly." >&2
+  exit 1
 fi
 echo "TOPK_CANDIDATES=${TOPK_CANDIDATES}"
 
