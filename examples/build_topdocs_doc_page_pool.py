@@ -38,6 +38,23 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--run-id", type=str, default=None, help="Optional run_id filter.")
     p.add_argument("--topk-docs", type=int, default=1000)
     p.add_argument("--pages-per-doc", type=int, default=6)
+    p.add_argument(
+        "--all-pages-per-doc",
+        action="store_true",
+        help="If set, include all available pages for each selected doc.",
+    )
+    p.add_argument(
+        "--doc-rank-col",
+        type=str,
+        default=None,
+        help="Optional doc-level rank column override (e.g., faiss_rank or maxsim_rank).",
+    )
+    p.add_argument(
+        "--doc-score-col",
+        type=str,
+        default=None,
+        help="Optional doc-level score column override (e.g., faiss_score or maxsim_score).",
+    )
     p.add_argument("--max-qids", type=int, default=None)
     p.add_argument("--qids-file", type=Path, default=None, help="Optional newline-separated qids.")
     return p.parse_args()
@@ -94,10 +111,29 @@ def main() -> int:
     doc_qid_col = _pick_column(doc_cols, ["qid", "query_id", "question_id"], "doc parquet qid column")
     doc_run_col = "run_id" if "run_id" in doc_cols else None
     doc_id_col = _pick_column(doc_cols, ["doc_id", "document_id", "pid"], "doc parquet doc_id column")
-    doc_max_rank_col = "maxsim_rank" if "maxsim_rank" in doc_cols else None
-    doc_faiss_rank_col = "faiss_rank" if "faiss_rank" in doc_cols else None
-    doc_max_score_col = "maxsim_score" if "maxsim_score" in doc_cols else None
-    doc_faiss_score_col = "faiss_score" if "faiss_score" in doc_cols else None
+    if args.doc_rank_col is not None:
+        doc_rank_col = _pick_column(doc_cols, [args.doc_rank_col], "doc parquet rank column")
+    else:
+        doc_rank_col = None
+        for c in ["faiss_rank", "maxsim_rank", "rank"]:
+            if c in doc_cols:
+                doc_rank_col = c
+                break
+    if args.doc_score_col is not None:
+        doc_score_col = _pick_column(doc_cols, [args.doc_score_col], "doc parquet score column")
+    else:
+        doc_score_col = None
+        preferred = []
+        if doc_rank_col == "faiss_rank":
+            preferred = ["faiss_score", "maxsim_score", "score"]
+        elif doc_rank_col == "maxsim_rank":
+            preferred = ["maxsim_score", "faiss_score", "score"]
+        else:
+            preferred = ["maxsim_score", "faiss_score", "score"]
+        for c in preferred:
+            if c in doc_cols:
+                doc_score_col = c
+                break
     doc_seed_page_col = None
     for c in ["maxsim_best_page", "best_page", "page_idx", "page_num"]:
         if c in doc_cols:
@@ -107,14 +143,10 @@ def main() -> int:
     read_doc_cols = [doc_qid_col, doc_id_col]
     if doc_run_col:
         read_doc_cols.append(doc_run_col)
-    if doc_max_rank_col:
-        read_doc_cols.append(doc_max_rank_col)
-    if doc_faiss_rank_col:
-        read_doc_cols.append(doc_faiss_rank_col)
-    if doc_max_score_col:
-        read_doc_cols.append(doc_max_score_col)
-    if doc_faiss_score_col:
-        read_doc_cols.append(doc_faiss_score_col)
+    if doc_rank_col:
+        read_doc_cols.append(doc_rank_col)
+    if doc_score_col:
+        read_doc_cols.append(doc_score_col)
     if doc_seed_page_col:
         read_doc_cols.append(doc_seed_page_col)
 
@@ -139,12 +171,8 @@ def main() -> int:
         run_val = row.get(doc_run_col) if doc_run_col else None
         if args.run_id and doc_run_col and str(run_val) != str(args.run_id):
             continue
-        max_rank = _to_int(row.get(doc_max_rank_col)) if doc_max_rank_col else None
-        faiss_rank = _to_int(row.get(doc_faiss_rank_col)) if doc_faiss_rank_col else None
-        rank = max_rank if max_rank is not None else faiss_rank
-        max_score = _to_float(row.get(doc_max_score_col)) if doc_max_score_col else None
-        faiss_score = _to_float(row.get(doc_faiss_score_col)) if doc_faiss_score_col else None
-        score = max_score if max_score is not None else faiss_score
+        rank = _to_int(row.get(doc_rank_col)) if doc_rank_col else None
+        score = _to_float(row.get(doc_score_col)) if doc_score_col else None
         if score is None:
             score = -float(rank if rank is not None else 1_000_000_000)
         seed_page = _to_int(row.get(doc_seed_page_col), default=0) if doc_seed_page_col else 0
@@ -238,7 +266,8 @@ def main() -> int:
             entries.sort(key=lambda x: x[0])
 
             chosen_pages = set()
-            for rk, p, sc in entries[: args.pages_per_doc]:
+            selected_entries = entries if args.all_pages_per_doc else entries[: args.pages_per_doc]
+            for rk, p, sc in selected_entries:
                 q_rows.append({"doc_id": d, "page_idx": int(p), "score": float(sc)})
                 chosen_pages.add(int(p))
             if seed not in chosen_pages:
@@ -257,6 +286,9 @@ def main() -> int:
             "run_id": args.run_id,
             "topk_docs": args.topk_docs,
             "pages_per_doc": args.pages_per_doc,
+            "all_pages_per_doc": bool(args.all_pages_per_doc),
+            "doc_rank_col": doc_rank_col,
+            "doc_score_col": doc_score_col,
             "max_qids": args.max_qids,
             "n_qids": len(top_pages),
         },

@@ -255,6 +255,12 @@ def _parse_args() -> argparse.Namespace:
         help="Optional page column override for --qrels-parquet.",
     )
     p.add_argument(
+        "--summary-ks",
+        type=str,
+        default="1,2,4,10,50,100,500",
+        help="Comma-separated k list for summary recall@k metrics.",
+    )
+    p.add_argument(
         "--debug-qid-topn",
         type=int,
         default=10,
@@ -1172,6 +1178,26 @@ def _summary_from_diagnostics(
     return out
 
 
+def _parse_summary_ks(ks_text: str) -> list[int]:
+    out: list[int] = []
+    seen: set[int] = set()
+    for tok in str(ks_text).split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            k = int(tok)
+        except Exception:
+            continue
+        if k <= 0:
+            continue
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(k)
+    return out or [1, 2, 4, 10, 50, 100, 500]
+
+
 def _select_best_page_per_doc(
     rows: list[dict[str, Any]],
     coherence_lambda: float,
@@ -1306,6 +1332,7 @@ def main() -> int:
     args = _parse_args()
     if args.self_test:
         return _run_self_test()
+    summary_ks = _parse_summary_ks(args.summary_ks)
 
     if args.output_json is None or args.embedding_dir is None:
         raise ValueError(
@@ -1538,13 +1565,14 @@ def main() -> int:
             "retrieval_model_name_or_path": args.retrieval_model_name_or_path,
             "retrieval_adapter_model_name_or_path": args.retrieval_adapter_model_name_or_path,
             "dtype": args.dtype,
+            "summary_ks": summary_ks,
         },
         "top_docs": reranked_top_docs,
         "top_pages": reranked_top_pages,
         "diagnostics": diagnostics,
     }
     if qid2gold_targets or (args.qid is not None and args.gold_doc_id is not None):
-        out["summary_metrics"] = _summary_from_diagnostics(diagnostics)
+        out["summary_metrics"] = _summary_from_diagnostics(diagnostics, ks=summary_ks)
 
     args.output_json.parent.mkdir(parents=True, exist_ok=True)
     with args.output_json.open("w") as f:
