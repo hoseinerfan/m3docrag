@@ -59,7 +59,7 @@ if [[ -z "${TOPK_CANDIDATES:-}" || "${TOPK_CANDIDATES}" == "auto" ]]; then
   else
     PY_BIN="python"
   fi
-  TOPK_CANDIDATES="$("$PY_BIN" - <<'PY'
+  TOPK_CANDIDATES="$(TOPDOCS_JSON="$TOPDOCS_JSON" "$PY_BIN" - <<'PY'
 import json
 import os
 import re
