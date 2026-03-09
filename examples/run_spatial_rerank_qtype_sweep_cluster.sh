@@ -167,6 +167,11 @@ if [[ ! -s "$MANIFEST_TSV" ]]; then
 fi
 
 tail -n +2 "$MANIFEST_TSV" | while IFS=$'\t' read -r QTYPE SLUG N_TOTAL N_SELECTED QFILE; do
+  QTYPE="${QTYPE//$'\r'/}"
+  SLUG="${SLUG//$'\r'/}"
+  N_TOTAL="${N_TOTAL//$'\r'/}"
+  N_SELECTED="${N_SELECTED//$'\r'/}"
+  QFILE="${QFILE//$'\r'/}"
   if [[ -z "$SLUG" || -z "$QFILE" ]]; then
     continue
   fi
