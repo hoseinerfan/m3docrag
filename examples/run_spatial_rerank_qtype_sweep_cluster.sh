@@ -46,7 +46,8 @@ echo "OUTROOT=$OUTROOT"
 
 echo "[1/3] Build per-type qid files"
 export QUESTIONS_PARQ QIDS_DIR MANIFEST_JSON MANIFEST_TSV N_PER_TYPE SAMPLE_SEED TYPE_REGEX MAX_TYPES
-conda run -n "$CONDA_ENV" python - <<'PY'
+STEP1_PY="$OUTROOT/_qtype_step1_manifest.py"
+cat > "$STEP1_PY" <<'PY'
 import csv
 import hashlib
 import json
@@ -157,6 +158,7 @@ print("n_types:", len(manifest))
 for r in manifest:
     print(f"{r['question_type']}: total={r['n_total_qids']} selected={r['n_selected_qids']}")
 PY
+conda run -n "$CONDA_ENV" python "$STEP1_PY"
 
 echo "[2/3] Run rerank sweep by question type"
 if [[ ! -s "$MANIFEST_TSV" ]]; then
@@ -204,7 +206,8 @@ done
 
 echo "[3/3] Build summary table"
 export MANIFEST_TSV RUNS_DIR SUMMARY_TSV
-conda run -n "$CONDA_ENV" python - <<'PY'
+STEP3_PY="$OUTROOT/_qtype_step3_summary.py"
+cat > "$STEP3_PY" <<'PY'
 import csv
 import json
 import os
@@ -307,5 +310,6 @@ for rec in rows:
         )
     )
 PY
+conda run -n "$CONDA_ENV" python "$STEP3_PY"
 
 echo "Done. Summary table: $SUMMARY_TSV"
