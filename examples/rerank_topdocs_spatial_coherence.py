@@ -187,12 +187,37 @@ def _parse_args() -> argparse.Namespace:
         "--score-mode",
         type=str,
         default="base_plus_coherence",
-        choices=["base_plus_coherence", "coherence_only", "density_only", "base_only"],
+        choices=[
+            "base_plus_coherence",
+            "coherence_only",
+            "density_only",
+            "base_only",
+            "doc_gated_evidence",
+        ],
         help=(
             "How to form rerank score: "
             "base_plus_coherence=z(base)+lambda*z(coherence), "
-            "coherence_only=z(coherence), density_only=z(cluster_mass), base_only=z(base)."
+            "coherence_only=z(coherence), density_only=z(cluster_mass), base_only=z(base), "
+            "doc_gated_evidence=doc-level base + gated max/top2 page-evidence."
         ),
+    )
+    p.add_argument(
+        "--evidence-mu",
+        type=float,
+        default=0.05,
+        help="Weight for top2 page-evidence term in doc_gated_evidence mode.",
+    )
+    p.add_argument(
+        "--min-support-count",
+        type=int,
+        default=3,
+        help="Minimum clustered informative-token count to enable evidence boost.",
+    )
+    p.add_argument(
+        "--min-support-diversity",
+        type=int,
+        default=2,
+        help="Minimum distinct clustered query terms to enable evidence boost.",
     )
     p.add_argument(
         "--rerank-mode",
@@ -744,9 +769,15 @@ def _idx_to_xy(idx: int, layout: SpatialLayout) -> tuple[float, float] | None:
     return float(col), float(row)
 
 
-def _largest_cluster_mass(coords: list[tuple[float, float]], weights: list[float], radius: float) -> float:
+def _largest_cluster_stats(
+    coords: list[tuple[float, float]],
+    weights: list[float],
+    radius: float,
+    token_labels: list[str],
+    margins: list[float],
+) -> tuple[float, int, int, float]:
     if not coords:
-        return 0.0
+        return 0.0, 0, 0, 0.0
     n = len(coords)
     parent = list(range(n))
 
@@ -771,16 +802,25 @@ def _largest_cluster_mass(coords: list[tuple[float, float]], weights: list[float
             if d2 <= r2:
                 union(i, j)
 
+    members: dict[int, list[int]] = defaultdict(list)
     mass = defaultdict(float)
     total = 0.0
     for i, w in enumerate(weights):
         root = find(i)
         wi = float(max(w, 0.0))
+        members[root].append(i)
         mass[root] += wi
         total += wi
-    if total <= 0.0:
-        return 0.0
-    return max(mass.values()) / total
+    if total <= 0.0 or not mass:
+        return 0.0, 0, 0, 0.0
+
+    best_root = max(mass.items(), key=lambda kv: kv[1])[0]
+    best_members = members.get(best_root, [])
+    cluster_mass = float(mass[best_root] / total)
+    support_count = int(len(best_members))
+    support_diversity = int(len({token_labels[i] for i in best_members if token_labels[i]}))
+    avg_margin = float(sum(float(margins[i]) for i in best_members) / len(best_members)) if best_members else 0.0
+    return cluster_mass, support_count, support_diversity, avg_margin
 
 
 def _weighted_entropy(ids: list[int], weights: list[float]) -> float:
@@ -925,6 +965,7 @@ def _page_features(
     coords = []
     picked_ids = []
     margins = []
+    token_labels = []
     pos2coord: dict[int, tuple[float, float]] = {}
     pos2w: dict[int, float] = {}
     alignments = []
@@ -947,6 +988,7 @@ def _page_features(
             weights.append(w)
             picked_ids.append(idx)
             margins.append(margin)
+            token_labels.append(_clean_piece(tok).lower())
             pos2coord[i] = xy
             pos2w[i] = w
         alignments.append(
@@ -969,6 +1011,9 @@ def _page_features(
                 "margin_conf": 0.0,
                 "spatial_coverage": 0.0,
                 "coherence": 0.0,
+                "support_count": 0,
+                "support_diversity": 0,
+                "avg_margin": 0.0,
             },
             {"alignments": alignments},
         )
@@ -985,6 +1030,9 @@ def _page_features(
                 "margin_conf": 0.0,
                 "spatial_coverage": coverage,
                 "coherence": 0.05 * coverage,
+                "support_count": 0,
+                "support_diversity": 0,
+                "avg_margin": 0.0,
             },
             {"alignments": alignments},
         )
@@ -992,7 +1040,13 @@ def _page_features(
     if sum(weights) <= 0.0:
         weights = [1.0 for _ in weights]
 
-    cluster_mass = _largest_cluster_mass(coords=coords, weights=weights, radius=cluster_radius)
+    cluster_mass, support_count, support_diversity, avg_margin = _largest_cluster_stats(
+        coords=coords,
+        weights=weights,
+        radius=cluster_radius,
+        token_labels=token_labels,
+        margins=margins,
+    )
     entropy = _weighted_entropy(picked_ids, weights)
     focus = 1.0 - entropy
     phrase_groups = _phrase_groups(informative_positions)
@@ -1004,6 +1058,7 @@ def _page_features(
     )
     margin_conf = (sum(margins) / len(margins)) if margins else 0.0
     margin_conf = float(max(0.0, min(1.0, margin_conf)))
+    avg_margin = float(max(0.0, min(1.0, avg_margin)))
 
     coherence = (
         0.45 * cluster_mass
@@ -1021,6 +1076,9 @@ def _page_features(
         "margin_conf": float(margin_conf),
         "spatial_coverage": float(coverage),
         "coherence": float(coherence),
+        "support_count": int(support_count),
+        "support_diversity": int(support_diversity),
+        "avg_margin": float(avg_margin),
     }
     debug = {
         "alignments": alignments,
@@ -1315,6 +1373,101 @@ def _final_score(
     raise ValueError(f"Unsupported score_mode={score_mode}")
 
 
+def _page_evidence_signal(
+    row: dict[str, Any],
+    min_support_count: int,
+    min_support_diversity: int,
+) -> float:
+    feats = row.get("features") or {}
+    support_count = int(feats.get("support_count", 0))
+    support_diversity = int(feats.get("support_diversity", 0))
+    if support_count < int(min_support_count):
+        return 0.0
+    if support_diversity < int(min_support_diversity):
+        return 0.0
+    cluster_mass = float(feats.get("cluster_mass", 0.0))
+    avg_margin = float(feats.get("avg_margin", feats.get("margin_conf", 0.0)))
+    if cluster_mass <= 0.0 or avg_margin <= 0.0:
+        return 0.0
+    return float(cluster_mass * avg_margin * math.log1p(max(0, support_count)))
+
+
+def _rerank_docs_with_gated_evidence(
+    rows: list[dict[str, Any]],
+    coherence_lambda: float,
+    evidence_mu: float,
+    min_support_count: int,
+    min_support_diversity: int,
+) -> list[dict[str, Any]]:
+    doc2rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    doc_order: list[str] = []
+    seen: set[str] = set()
+    for r in rows:
+        d = str(r["doc_id"])
+        if d not in seen:
+            seen.add(d)
+            doc_order.append(d)
+        doc2rows[d].append(r)
+
+    if not doc_order:
+        return []
+
+    base_doc_scores: list[float] = []
+    max_evidence_scores: list[float] = []
+    top2_evidence_scores: list[float] = []
+    chosen_rows: list[dict[str, Any]] = []
+
+    for d in doc_order:
+        pages = doc2rows[d]
+        page_evidences = [
+            _page_evidence_signal(
+                r,
+                min_support_count=min_support_count,
+                min_support_diversity=min_support_diversity,
+            )
+            for r in pages
+        ]
+
+        best_idx = 0
+        best_ev = float("-inf")
+        best_base = float("-inf")
+        for i, r in enumerate(pages):
+            ev = float(page_evidences[i])
+            base_s = float(r["base_score"])
+            if ev > best_ev or (ev == best_ev and base_s > best_base):
+                best_ev = ev
+                best_base = base_s
+                best_idx = i
+
+        ev_sorted = sorted((float(x) for x in page_evidences), reverse=True)
+        doc_max_ev = ev_sorted[0] if ev_sorted else 0.0
+        doc_top2_ev = (
+            float(sum(ev_sorted[:2]) / min(2, len(ev_sorted))) if ev_sorted else 0.0
+        )
+        doc_base = max(float(r["base_score"]) for r in pages)
+
+        rec = pages[best_idx].copy()
+        rec["page_evidence"] = float(page_evidences[best_idx])
+        rec["doc_max_evidence"] = float(doc_max_ev)
+        rec["doc_top2_evidence"] = float(doc_top2_ev)
+        chosen_rows.append(rec)
+
+        base_doc_scores.append(float(doc_base))
+        max_evidence_scores.append(float(doc_max_ev))
+        top2_evidence_scores.append(float(doc_top2_ev))
+
+    base_z = _zscore(base_doc_scores)
+    max_ev_z = _zscore(max_evidence_scores)
+    top2_ev_z = _zscore(top2_evidence_scores)
+    for i, rec in enumerate(chosen_rows):
+        rec["final_score"] = float(
+            base_z[i] + coherence_lambda * max_ev_z[i] + evidence_mu * top2_ev_z[i]
+        )
+
+    chosen_rows.sort(key=lambda x: x["final_score"], reverse=True)
+    return chosen_rows
+
+
 def _run_self_test() -> int:
     torch.manual_seed(7)
     q = torch.randn(12, 16)
@@ -1546,6 +1699,9 @@ def main() -> int:
                     }
                 )
 
+        if args.score_mode == "doc_gated_evidence" and args.rerank_mode != "per_doc_reorder":
+            raise ValueError("score_mode=doc_gated_evidence requires --rerank-mode per_doc_reorder")
+
         if args.rerank_mode == "per_doc_page":
             reranked = _select_best_page_per_doc(
                 rows,
@@ -1553,16 +1709,25 @@ def main() -> int:
                 score_mode=args.score_mode,
             )
         elif args.rerank_mode == "per_doc_reorder":
-            chosen = _select_best_page_per_doc(
-                rows,
-                coherence_lambda=args.coherence_lambda,
-                score_mode=args.score_mode,
-            )
-            reranked = _rerank_pages_globally(
-                chosen,
-                coherence_lambda=args.coherence_lambda,
-                score_mode=args.score_mode,
-            )
+            if args.score_mode == "doc_gated_evidence":
+                reranked = _rerank_docs_with_gated_evidence(
+                    rows,
+                    coherence_lambda=args.coherence_lambda,
+                    evidence_mu=args.evidence_mu,
+                    min_support_count=args.min_support_count,
+                    min_support_diversity=args.min_support_diversity,
+                )
+            else:
+                chosen = _select_best_page_per_doc(
+                    rows,
+                    coherence_lambda=args.coherence_lambda,
+                    score_mode=args.score_mode,
+                )
+                reranked = _rerank_pages_globally(
+                    chosen,
+                    coherence_lambda=args.coherence_lambda,
+                    score_mode=args.score_mode,
+                )
         else:
             reranked = _rerank_pages_globally(
                 rows,
@@ -1577,6 +1742,9 @@ def main() -> int:
                 "score": float(r["final_score"]),
                 "base_score": float(r["base_score"]),
                 "coherence": float(r["coherence"]),
+                "page_evidence": float(r.get("page_evidence", 0.0)),
+                "doc_max_evidence": float(r.get("doc_max_evidence", r.get("page_evidence", 0.0))),
+                "doc_top2_evidence": float(r.get("doc_top2_evidence", r.get("page_evidence", 0.0))),
                 "features": r["features"],
             }
             for r in save_rows
@@ -1607,6 +1775,9 @@ def main() -> int:
                 {"doc_id": d, "page_idx": p} for d, p in gold_targets[:5]
             ],
             "coherence_lambda": args.coherence_lambda,
+            "evidence_mu": args.evidence_mu,
+            "min_support_count": args.min_support_count,
+            "min_support_diversity": args.min_support_diversity,
             "score_mode": args.score_mode,
             "rerank_mode": args.rerank_mode,
             "eval_granularity": eval_granularity,
@@ -1635,6 +1806,9 @@ def main() -> int:
             "topk_candidates": args.topk_candidates,
             "save_top_k": args.save_top_k,
             "coherence_lambda": args.coherence_lambda,
+            "evidence_mu": args.evidence_mu,
+            "min_support_count": args.min_support_count,
+            "min_support_diversity": args.min_support_diversity,
             "score_mode": args.score_mode,
             "rerank_mode": args.rerank_mode,
             "cluster_radius": args.cluster_radius,

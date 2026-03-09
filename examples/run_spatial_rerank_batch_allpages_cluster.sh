@@ -29,6 +29,9 @@ ADAPTER="${ADAPTER:-/mmfs1/scratch/jacks.local/aerfanshekooh/custom/models/colpa
 COHERENCE_LAMBDA="${COHERENCE_LAMBDA:-0.15}"
 RERANK_MODE="${RERANK_MODE:-per_doc_reorder}"
 SCORE_MODE="${SCORE_MODE:-base_plus_coherence}"
+EVIDENCE_MU="${EVIDENCE_MU:-0.05}"
+MIN_SUPPORT_COUNT="${MIN_SUPPORT_COUNT:-3}"
+MIN_SUPPORT_DIVERSITY="${MIN_SUPPORT_DIVERSITY:-2}"
 SUMMARY_KS="${SUMMARY_KS:-1,2,4,10,50,100,500}"
 
 OUTDIR="${OUTDIR:-outputs/spatial_batch_allpages}"
@@ -37,6 +40,7 @@ mkdir -p "$OUTDIR"
 echo "RUN_ID=$RUN_ID TOPK_DOCS=$TOPK_DOCS MAX_QIDS=$MAX_QIDS"
 echo "DOC_RANK_COL=$DOC_RANK_COL DOC_SCORE_COL=$DOC_SCORE_COL"
 echo "RERANK_MODE=$RERANK_MODE SCORE_MODE=$SCORE_MODE COHERENCE_LAMBDA=$COHERENCE_LAMBDA"
+echo "EVIDENCE_MU=$EVIDENCE_MU MIN_SUPPORT_COUNT=$MIN_SUPPORT_COUNT MIN_SUPPORT_DIVERSITY=$MIN_SUPPORT_DIVERSITY"
 echo "QIDS_FILE=${QIDS_FILE:-<none>}"
 
 TOPDOCS_JSON="${TOPDOCS_JSON:-$OUTDIR/topdocs_doc${TOPK_DOCS}_allpages_${RUN_ID}.json}"
@@ -114,6 +118,9 @@ RERANK_ARGS=(
   --save-top-k "$TOPK_DOCS"
   --coherence-lambda "$COHERENCE_LAMBDA"
   --score-mode "$SCORE_MODE"
+  --evidence-mu "$EVIDENCE_MU"
+  --min-support-count "$MIN_SUPPORT_COUNT"
+  --min-support-diversity "$MIN_SUPPORT_DIVERSITY"
   --rerank-mode "$RERANK_MODE"
   --summary-ks "$SUMMARY_KS"
 )
