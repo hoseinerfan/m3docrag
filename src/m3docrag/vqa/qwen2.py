@@ -15,12 +15,9 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from PIL import Image
-import requests
 import torch
-from torchvision import io
-from typing import Dict, List
+from typing import List
 from transformers import AutoConfig, AutoProcessor, BitsAndBytesConfig
-from qwen_vl_utils import process_vision_info
 
 
 def init(
@@ -47,6 +44,11 @@ def init(
     if config_model_type in {"qwen2_5_vl", "qwen2_vl"}:
         effective_model_type = config_model_type
 
+    # Qwen2.5-VL has been unstable with flash-attn on some cluster stacks.
+    # Prefer eager attention for reliability in offline summary generation.
+    if effective_model_type == "qwen2_5_vl" and attn_implementation == "flash_attention_2":
+        attn_implementation = "eager"
+
     if effective_model_type == "qwen2_5_vl":
         try:
             from transformers import Qwen2_5_VLForConditionalGeneration as QwenVLForConditionalGeneration
@@ -71,7 +73,11 @@ def init(
         quantization_config=bnb_config,
     )
     model.eval()
-    processor = AutoProcessor.from_pretrained(model_name_or_path)
+    processor_kwargs = {}
+    if effective_model_type == "qwen2_5_vl":
+        # Slow processor path is more stable for Qwen2.5-VL in this environment.
+        processor_kwargs["use_fast"] = False
+    processor = AutoProcessor.from_pretrained(model_name_or_path, **processor_kwargs)
 
     return {
         'model': model,
@@ -84,8 +90,24 @@ def generate(
     question,
     images
 ) -> List[str]:
+    if not images:
+        return [""]
 
-    image_content = [{"type": "image", "image": "dummy_content"}] * len(images)
+    # Downscale very large pages to reduce visual-kernel instability.
+    resized_images = []
+    for image in images:
+        if not isinstance(image, Image.Image):
+            resized_images.append(image)
+            continue
+        img = image.convert("RGB")
+        w, h = img.size
+        max_side = 1344
+        if max(w, h) > max_side:
+            scale = max_side / float(max(w, h))
+            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BICUBIC)
+        resized_images.append(img)
+
+    image_content = [{"type": "image", "image": "dummy_content"}] * len(resized_images)
 
     messages = [
         {
@@ -99,7 +121,7 @@ def generate(
     # image_inputs, video_inputs = process_vision_info(messages)
     inputs = processor(
         text=[text],
-        images=images,
+        images=resized_images,
         # videos=video_inputs,
         padding=True,
         return_tensors="pt",
