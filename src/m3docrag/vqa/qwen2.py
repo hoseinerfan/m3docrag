@@ -19,12 +19,13 @@ import requests
 import torch
 from torchvision import io
 from typing import Dict, List
-from transformers import Qwen2VLForConditionalGeneration, AutoTokenizer, AutoProcessor, BitsAndBytesConfig
+from transformers import AutoConfig, AutoProcessor, BitsAndBytesConfig
 from qwen_vl_utils import process_vision_info
 
 
 def init(
     model_name_or_path,
+    model_type="qwen2",
     dtype=torch.bfloat16,
     bits=16,
     attn_implementation="flash_attention_2",
@@ -39,14 +40,35 @@ def init(
         )
     else:
         bnb_config = None
+    model_type_l = str(model_type).lower()
+    config = AutoConfig.from_pretrained(model_name_or_path, trust_remote_code=True)
+    config_model_type = str(getattr(config, "model_type", "")).lower()
+    effective_model_type = model_type_l
+    if config_model_type in {"qwen2_5_vl", "qwen2_vl"}:
+        effective_model_type = config_model_type
+
+    if effective_model_type == "qwen2_5_vl":
+        try:
+            from transformers import Qwen2_5_VLForConditionalGeneration as QwenVLForConditionalGeneration
+        except Exception as exc:
+            raise RuntimeError(
+                "Transformers build does not expose Qwen2_5_VLForConditionalGeneration. "
+                "Upgrade transformers to a version that supports qwen2_5_vl."
+            ) from exc
+    elif effective_model_type in {"qwen2_vl", "qwen2"}:
+        from transformers import Qwen2VLForConditionalGeneration as QwenVLForConditionalGeneration
+    else:
+        raise ValueError(
+            f"Unsupported Qwen VL model type: requested={model_type_l} config={config_model_type}"
+        )
+
     # Load the model in half-precision on the available device(s)
-    model = Qwen2VLForConditionalGeneration.from_pretrained(
+    model = QwenVLForConditionalGeneration.from_pretrained(
         model_name_or_path,
-        torch_dtype=dtype,
+        dtype=dtype,
         low_cpu_mem_usage=True,
         attn_implementation=attn_implementation,
         quantization_config=bnb_config,
-        vision_config={"torch_dtype": dtype}
     )
     model.eval()
     processor = AutoProcessor.from_pretrained(model_name_or_path)

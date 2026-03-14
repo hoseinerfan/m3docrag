@@ -26,7 +26,7 @@ from m3docrag.vqa import idefics3
 from m3docrag.vqa import florence2
 from m3docrag.vqa import qwen2
 
-ALL_VQA_MODEL_TYPES = ['florence2', 'idefics2', 'internvl2', 'idefics3', 'qwen2']
+ALL_VQA_MODEL_TYPES = ['florence2', 'idefics2', 'internvl2', 'idefics3', 'qwen2', 'qwen2_5_vl']
 
 def init(
     model_name_or_path: Union[str, Path],
@@ -54,9 +54,10 @@ def init(
             model_name_or_path=model_name_or_path,
             **kwargs
         )
-    elif 'qwen2' == model_type.lower():
+    elif model_type.lower() in {'qwen2', 'qwen2_5_vl'}:
         return qwen2.init(
             model_name_or_path=model_name_or_path,
+            model_type=model_type.lower(),
             **kwargs
         )
     else:
@@ -94,7 +95,7 @@ def generate(
             processor=processor,
             **kwargs
         )
-    elif 'qwen2' == model_type.lower():
+    elif model_type.lower() in {'qwen2', 'qwen2_5_vl'}:
         return qwen2.generate(
             model=model,
             processor=processor,

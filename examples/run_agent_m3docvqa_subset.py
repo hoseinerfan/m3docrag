@@ -12,7 +12,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 from loguru import logger
@@ -194,6 +194,26 @@ def parse_args():
         type=int,
         default=1000,
         help="Max metadata candidates kept per query when --selection-summary-full-scan is enabled.",
+    )
+    p.add_argument(
+        "--selection-retriever-agent",
+        action="store_true",
+        help=(
+            "Use an LLM-based RetrieverAgent-style reranker in --selection-only mode. "
+            "The model receives query + candidate page summaries and chooses which docs/pages to prioritize."
+        ),
+    )
+    p.add_argument(
+        "--selection-retriever-candidate-docs",
+        type=int,
+        default=40,
+        help="Number of unique candidate docs shown to RetrieverAgent per query in --selection-only mode.",
+    )
+    p.add_argument(
+        "--selection-retriever-select-docs",
+        type=int,
+        default=12,
+        help="Max docs/pages parsed from RetrieverAgent output per query in --selection-only mode.",
     )
     p.add_argument(
         "--page-summaries-file",
@@ -566,6 +586,189 @@ def _plan_selection_hop_queries(
 def _selection_only_retrieval_depth(selection_topk_docs_per_hop: int) -> int:
     quota = max(selection_topk_docs_per_hop, 1)
     return max(quota * 8, 8)
+
+
+def _selection_retriever_prompt(
+    *,
+    question: str,
+    candidates: list[dict],
+    max_select_docs: int,
+) -> str:
+    lines = []
+    for row in candidates:
+        summary = _norm_text(str(row.get("summary") or ""))[:220]
+        lines.append(
+            f"[{row['candidate_index']}] doc_id={row['doc_id']} page_idx={row['page_idx']} "
+            f"retrieval_score={row['score']:.4f} summary={summary}"
+        )
+    joined_candidates = "\n".join(lines)
+    return (
+        "You are a RetrieverAgent for multi-hop document QA.\n"
+        "Task: choose candidate docs/pages most likely to contain evidence for the query.\n"
+        "Prioritize evidence-bearing pages, not generic background pages.\n\n"
+        f"QUERY:\n{question}\n\n"
+        "CANDIDATES:\n"
+        f"{joined_candidates}\n\n"
+        "Return JSON only with this schema:\n"
+        "{\n"
+        '  "selected": [\n'
+        '    {"candidate_index": 1, "doc_id": "<id>", "page_idx": 0}\n'
+        "  ]\n"
+        "}\n"
+        f"Rules:\n- select at most {max(max_select_docs, 1)} items.\n"
+        "- choose from listed candidates only.\n"
+        "- no extra keys, no markdown, no explanation.\n"
+    )
+
+
+def _parse_selection_retriever_response(
+    *,
+    raw_reply: str,
+    candidate_rows: list[tuple[str, int, float]],
+    max_select_docs: int,
+) -> list[tuple[str, int, float]]:
+    if not raw_reply:
+        return []
+
+    candidate_by_index = {idx + 1: row for idx, row in enumerate(candidate_rows)}
+    candidate_by_doc = {str(doc_id): row for doc_id, page_idx, score in candidate_rows}
+    picked: list[tuple[str, int, float]] = []
+    picked_uids: set[str] = set()
+
+    payload = _extract_first_json_object(raw_reply)
+    selected_items = None
+    if isinstance(payload, dict):
+        for key in ("selected", "selected_pages", "pages", "choices"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                selected_items = value
+                break
+
+    if isinstance(selected_items, list):
+        for item in selected_items:
+            row = None
+            if isinstance(item, dict):
+                idx = item.get("candidate_index")
+                if isinstance(idx, int) and idx in candidate_by_index:
+                    row = candidate_by_index[idx]
+                if row is None:
+                    doc_id = str(item.get("doc_id") or "").strip()
+                    page_idx = item.get("page_idx")
+                    if doc_id and isinstance(page_idx, int):
+                        row = candidate_by_doc.get(doc_id)
+                        if row and int(row[1]) != int(page_idx):
+                            row = None
+                    elif doc_id:
+                        row = candidate_by_doc.get(doc_id)
+            elif isinstance(item, int):
+                row = candidate_by_index.get(item)
+            if row is None:
+                continue
+            uid = f"{row[0]}#p{int(row[1])}"
+            if uid in picked_uids:
+                continue
+            picked.append(row)
+            picked_uids.add(uid)
+            if len(picked) >= max(max_select_docs, 1):
+                return picked
+
+    # Fallback: parse doc IDs in raw text.
+    doc_ids = re.findall(r"\b[0-9a-f]{32}\b", raw_reply.casefold())
+    for doc_id in doc_ids:
+        row = candidate_by_doc.get(doc_id)
+        if row is None:
+            continue
+        uid = f"{row[0]}#p{int(row[1])}"
+        if uid in picked_uids:
+            continue
+        picked.append(row)
+        picked_uids.add(uid)
+        if len(picked) >= max(max_select_docs, 1):
+            break
+    return picked
+
+
+def _rerank_with_selection_retriever_agent(
+    *,
+    query: str,
+    retrieved: list[tuple[str, int, float]],
+    page_summary_map: Optional[dict[str, str]],
+    llm_call: Optional[Callable[[str], str]],
+    candidate_doc_limit: int,
+    max_select_docs: int,
+) -> tuple[list[tuple[str, int, float]], dict]:
+    trace = {
+        "enabled": True,
+        "candidate_docs_considered": 0,
+        "selected_count": 0,
+        "parse_success": False,
+        "selected_docs": [],
+        "raw_reply_preview": None,
+        "error": None,
+    }
+    if not retrieved or llm_call is None:
+        trace["enabled"] = False
+        return retrieved, trace
+
+    candidate_rows: list[tuple[str, int, float]] = []
+    candidate_payload: list[dict] = []
+    seen_docs: set[str] = set()
+    for doc_id, page_idx, score in retrieved:
+        doc_id = str(doc_id)
+        if doc_id in seen_docs:
+            continue
+        seen_docs.add(doc_id)
+        candidate_rows.append((doc_id, int(page_idx), float(score)))
+        summary_text = _lookup_page_summary(page_summary_map, doc_id, int(page_idx)) or ""
+        candidate_payload.append(
+            {
+                "candidate_index": len(candidate_rows),
+                "doc_id": doc_id,
+                "page_idx": int(page_idx),
+                "score": float(score),
+                "summary": summary_text,
+            }
+        )
+        if len(candidate_rows) >= max(candidate_doc_limit, 1):
+            break
+
+    trace["candidate_docs_considered"] = len(candidate_rows)
+    if not candidate_rows:
+        return retrieved, trace
+
+    prompt = _selection_retriever_prompt(
+        question=query,
+        candidates=candidate_payload,
+        max_select_docs=max_select_docs,
+    )
+    try:
+        raw_reply = llm_call(prompt)
+    except Exception as exc:
+        trace["error"] = str(exc)
+        return retrieved, trace
+
+    raw_reply = raw_reply or ""
+    trace["raw_reply_preview"] = _norm_text(raw_reply)[:400]
+    selected_rows = _parse_selection_retriever_response(
+        raw_reply=raw_reply,
+        candidate_rows=candidate_rows,
+        max_select_docs=max_select_docs,
+    )
+    if not selected_rows:
+        return retrieved, trace
+
+    trace["parse_success"] = True
+    trace["selected_count"] = len(selected_rows)
+    trace["selected_docs"] = [
+        {"doc_id": str(doc_id), "page_idx": int(page_idx)}
+        for doc_id, page_idx, _ in selected_rows
+    ]
+
+    selected_uids = {f"{doc_id}#p{int(page_idx)}" for doc_id, page_idx, _ in selected_rows}
+    remainder = [
+        row for row in retrieved if f"{str(row[0])}#p{int(row[1])}" not in selected_uids
+    ]
+    return selected_rows + remainder, trace
 
 
 def _page_key_variants(doc_id: str, page_idx: int) -> list[str]:
@@ -1160,6 +1363,10 @@ def run_selection_only_session(
     selection_max_variant_queries: Optional[int] = None,
     selection_summary_full_scan: bool = False,
     selection_summary_full_scan_topk: int = 1000,
+    selection_retriever_agent: bool = False,
+    selection_retriever_candidate_docs: int = 40,
+    selection_retriever_select_docs: int = 12,
+    selection_retriever_llm_call: Optional[Callable[[str], str]] = None,
     page_summary_map: Optional[dict[str, str]] = None,
     page_visual_meta_map: Optional[dict[str, dict[str, float | bool]]] = None,
     selection_visual_boost: float = 2.0,
@@ -1239,6 +1446,16 @@ def run_selection_only_session(
             retrieved_for_selection = metadata_candidates + [x for x in retrieved if x[0] not in seen_doc_ids]
         else:
             retrieved_for_selection = retrieved
+        retriever_agent_trace = None
+        if selection_retriever_agent:
+            retrieved_for_selection, retriever_agent_trace = _rerank_with_selection_retriever_agent(
+                query=hop_query,
+                retrieved=retrieved_for_selection,
+                page_summary_map=page_summary_map,
+                llm_call=selection_retriever_llm_call,
+                candidate_doc_limit=selection_retriever_candidate_docs,
+                max_select_docs=selection_retriever_select_docs,
+            )
 
         top_docs = _top_docs_payload_from_pages(
             retrieved_for_selection,
@@ -1277,6 +1494,7 @@ def run_selection_only_session(
                         "requested_page_count": query_retrieval_depth,
                         "returned_page_count": len(retrieved),
                         "metadata_full_scan_candidates": len(metadata_candidates),
+                        "retriever_agent": retriever_agent_trace,
                         "top_pages": _top_pages_payload_from_pages(
                             retrieved_for_selection,
                             limit=query_retrieval_depth,
@@ -1310,6 +1528,9 @@ def run_selection_only_session(
                 "page_visual_metadata_enabled": bool(page_visual_meta_map),
                 "summary_full_scan": selection_summary_full_scan,
                 "summary_full_scan_topk": selection_summary_full_scan_topk,
+                "selection_retriever_agent": selection_retriever_agent,
+                "selection_retriever_candidate_docs": selection_retriever_candidate_docs,
+                "selection_retriever_select_docs": selection_retriever_select_docs,
                 "selection_visual_boost": selection_visual_boost,
                 "selection_visual_min_confidence": selection_visual_min_confidence,
             },
@@ -1717,7 +1938,15 @@ def main():
     policy_device = args.policy_device or args.device
     if args.selection_only:
         llm_call = None
-        logger.info("Selection-only mode uses heuristic hop planning; skipping policy model initialization.")
+        if args.selection_retriever_agent:
+            if args.policy_backend != "local-hf":
+                raise ValueError("--selection-retriever-agent requires --policy-backend local-hf")
+            if not args.policy_model:
+                raise ValueError("--policy-model is required when --selection-retriever-agent is enabled")
+            llm_call = make_llm_call_local_hf(args.policy_model, device=policy_device)
+            logger.info("Selection-only RetrieverAgent reranker active via local-hf policy model.")
+        else:
+            logger.info("Selection-only mode uses heuristic hop planning; skipping policy model initialization.")
     elif args.policy_backend == "stub":
         llm_call = make_llm_call_stub()
     else:
@@ -1740,6 +1969,8 @@ def main():
     if args.page_summaries_file is not None:
         page_summary_map = load_context_map(args.page_summaries_file)
         logger.info("Loaded {} page summaries from {}", len(page_summary_map), args.page_summaries_file)
+    if args.selection_retriever_agent and not page_summary_map:
+        raise ValueError("--selection-retriever-agent requires --page-summaries-file")
     page_visual_meta_map = None
     if args.page_visual_metadata_file is not None:
         page_visual_meta_map = load_page_visual_metadata_map(args.page_visual_metadata_file)
@@ -1845,6 +2076,10 @@ def main():
                         selection_max_variant_queries=args.selection_max_variant_queries,
                         selection_summary_full_scan=args.selection_summary_full_scan,
                         selection_summary_full_scan_topk=args.selection_summary_full_scan_topk,
+                        selection_retriever_agent=args.selection_retriever_agent,
+                        selection_retriever_candidate_docs=args.selection_retriever_candidate_docs,
+                        selection_retriever_select_docs=args.selection_retriever_select_docs,
+                        selection_retriever_llm_call=llm_call,
                         page_summary_map=page_summary_map,
                         page_visual_meta_map=page_visual_meta_map,
                         selection_visual_boost=args.selection_visual_boost,
@@ -1939,6 +2174,9 @@ def main():
             "selection_max_variant_queries": args.selection_max_variant_queries,
             "selection_summary_full_scan": args.selection_summary_full_scan,
             "selection_summary_full_scan_topk": args.selection_summary_full_scan_topk,
+            "selection_retriever_agent": args.selection_retriever_agent,
+            "selection_retriever_candidate_docs": args.selection_retriever_candidate_docs,
+            "selection_retriever_select_docs": args.selection_retriever_select_docs,
             "page_summaries_file": (str(args.page_summaries_file) if args.page_summaries_file else None),
             "page_visual_metadata_file": (
                 str(args.page_visual_metadata_file) if args.page_visual_metadata_file else None
