@@ -291,6 +291,12 @@ def parse_args():
         help="Optional cap on pages summarized per document.",
     )
     p.add_argument(
+        "--page-start-per-doc",
+        type=int,
+        default=0,
+        help="0-based start page index per document before applying --max-pages-per-doc.",
+    )
+    p.add_argument(
         "--model-name-or-path",
         default="Qwen2-VL-7B-Instruct",
         help="Local model path or folder name under LOCAL_MODEL_DIR.",
@@ -568,11 +574,14 @@ def summarize_doc_pages(
         raise FileNotFoundError(pdf_path)
 
     images = get_images_from_pdf(pdf_path)
+    page_start = 0
+    page_end = len(images)
     if max_pages_per_doc is not None:
-        images = images[: max(max_pages_per_doc, 0)]
+        page_end = min(page_end, page_start + max(max_pages_per_doc, 0))
 
     rows: list[dict] = []
-    for page_idx, image in enumerate(images):
+    for page_idx in range(page_start, page_end):
+        image = images[page_idx]
         summary = model.generate(images=[image], question=prompt).strip()
         rows.append(
             {
@@ -614,18 +623,35 @@ def main():
                     continue
 
                 images = get_images_from_pdf(pdf_path)
-                page_limit = len(images)
+                page_start = max(0, int(args.page_start_per_doc))
+                page_end = len(images)
                 if args.max_pages_per_doc is not None:
-                    page_limit = min(page_limit, max(args.max_pages_per_doc, 0))
+                    page_end = min(page_end, page_start + max(args.max_pages_per_doc, 0))
+                if page_start >= len(images):
+                    logger.warning(
+                        "[{}/{}] doc_id={} | page_start {} out of range for pdf_pages={}",
+                        idx,
+                        len(doc_ids),
+                        doc_id,
+                        page_start,
+                        len(images),
+                    )
+                    continue
 
                 unsummarized_pages = [
                     page_idx
-                    for page_idx in range(page_limit)
+                    for page_idx in range(page_start, page_end)
                     if (doc_id, page_idx) not in existing_keys
                 ]
                 if not unsummarized_pages:
-                    total_skipped += page_limit
-                    logger.info("[{}/{}] doc_id={} | all {} pages already summarized", idx, len(doc_ids), doc_id, page_limit)
+                    total_skipped += max(0, page_end - page_start)
+                    logger.info(
+                        "[{}/{}] doc_id={} | all {} pages already summarized",
+                        idx,
+                        len(doc_ids),
+                        doc_id,
+                        max(0, page_end - page_start),
+                    )
                     continue
 
                 logger.info(
