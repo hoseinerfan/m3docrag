@@ -20,20 +20,213 @@ from m3docrag.utils.paths import LOCAL_DATA_DIR, LOCAL_MODEL_DIR
 from m3docrag.utils.pdfs import get_images_from_pdf
 from m3docrag.vqa import VQAModel
 
-from run_agent_m3docvqa_subset import (  # type: ignore
-    _load_json_or_jsonl,
-    _load_qid_filter,
-    extract_supporting_doc_ids,
-    load_mmqa_examples,
-    load_retrieval_doc_pools_from_parquet,
-)
-
-
 SUMMARY_PROMPT = (
     "Summarize this single document page for retrieval. "
     "Mention the main topic, key names/titles/dates, and important visible figures, logos, symbols, or charts. "
     "Keep the summary concise and factual, under 80 words."
 )
+
+
+def _load_json_or_jsonl(path: Path):
+    suffixes = {s.lower() for s in path.suffixes}
+    if ".jsonl" in suffixes:
+        rows = []
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+        return rows
+    return json.loads(path.read_text())
+
+
+def _load_qid_filter(path: Optional[Path]) -> Optional[set[str]]:
+    if path is None:
+        return None
+    try:
+        payload = _load_json_or_jsonl(path)
+    except Exception:
+        return {line.strip() for line in path.read_text().splitlines() if line.strip()}
+    out = set()
+    if isinstance(payload, dict):
+        out.update(str(k) for k in payload.keys())
+        return out
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, str):
+                out.add(item)
+            elif isinstance(item, dict):
+                qid = item.get("qid") or item.get("id")
+                if qid is not None:
+                    out.add(str(qid))
+        return out
+    if isinstance(payload, str):
+        out.add(payload)
+        return out
+    return {line.strip() for line in path.read_text().splitlines() if line.strip()}
+
+
+def load_mmqa_examples(path: Path) -> list[dict]:
+    examples = []
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            examples.append(json.loads(line))
+    return examples
+
+
+def extract_supporting_doc_ids(example: dict) -> list[str]:
+    out: list[str] = []
+    for row in example.get("supporting_context", []) or []:
+        if isinstance(row, dict):
+            doc_id = row.get("doc_id")
+            if doc_id is not None:
+                out.append(str(doc_id))
+    seen = set()
+    ordered = []
+    for d in out:
+        if d in seen:
+            continue
+        seen.add(d)
+        ordered.append(d)
+    return ordered
+
+
+def _pick_column(
+    names: list[str],
+    explicit: Optional[str],
+    candidates: list[str],
+    label: str,
+    required: bool = True,
+) -> Optional[str]:
+    if explicit is not None:
+        if explicit not in names:
+            raise ValueError(f"{label} column {explicit!r} not found in parquet columns: {names}")
+        return explicit
+    lower_map = {n.lower(): n for n in names}
+    for cand in candidates:
+        if cand.lower() in lower_map:
+            return lower_map[cand.lower()]
+    if required:
+        raise ValueError(f"Could not auto-detect {label} column. Available columns: {names}")
+    return None
+
+
+def load_retrieval_doc_pools_from_parquet(
+    *,
+    parquet_path: Path,
+    qids: list[str],
+    topk_docs: int,
+    qid_col: Optional[str],
+    doc_col: Optional[str],
+    rank_col: Optional[str],
+    score_col: Optional[str],
+) -> dict[str, list[dict]]:
+    if not parquet_path.exists():
+        raise FileNotFoundError(parquet_path)
+
+    qid_set = {str(q) for q in qids}
+    try:
+        import pyarrow.dataset as ds
+    except Exception as exc:
+        raise RuntimeError("pyarrow is required to load retrieval parquet.") from exc
+
+    dataset = ds.dataset(str(parquet_path), format="parquet")
+    col_names = list(dataset.schema.names)
+    qid_col = _pick_column(col_names, qid_col, ["qid", "query_id", "question_id"], "qid")
+    doc_col = _pick_column(
+        col_names,
+        doc_col,
+        ["doc_id", "document_id", "candidate_doc_id", "dst_doc_id", "target_doc_id", "node_id_dst"],
+        "doc_id",
+    )
+    rank_col = _pick_column(col_names, rank_col, ["rank", "retrieval_rank", "position", "pos", "idx"], "rank", required=False)
+    score_col = _pick_column(col_names, score_col, ["score", "retrieval_score", "sim", "similarity", "weight"], "score", required=False)
+
+    cols = [qid_col, doc_col]
+    if rank_col:
+        cols.append(rank_col)
+    if score_col and score_col not in cols:
+        cols.append(score_col)
+
+    try:
+        table = dataset.to_table(columns=cols, filter=ds.field(qid_col).isin(list(qid_set)))
+    except Exception:
+        table = dataset.to_table(columns=cols)
+
+    rows = []
+    for row in table.to_pylist():
+        qid = row.get(qid_col)
+        doc_id = row.get(doc_col)
+        if qid is None or doc_id is None:
+            continue
+        qid = str(qid)
+        if qid not in qid_set:
+            continue
+        rows.append(
+            {
+                "qid": qid,
+                "doc_id": str(doc_id),
+                "source_rank": row.get(rank_col) if rank_col else None,
+                "score": row.get(score_col) if score_col else None,
+            }
+        )
+
+    grouped: dict[str, list[dict]] = {q: [] for q in qids}
+    for row in rows:
+        grouped.setdefault(row["qid"], []).append(row)
+
+    out: dict[str, list[dict]] = {}
+    for qid in qids:
+        items = grouped.get(qid, [])
+        if rank_col:
+            def _rank_key(x):
+                r = x.get("source_rank")
+                try:
+                    return (0, int(r))
+                except Exception:
+                    return (1, float("inf"))
+            items = sorted(items, key=_rank_key)
+        elif score_col:
+            def _score_key(x):
+                s = x.get("score")
+                try:
+                    return float(s)
+                except Exception:
+                    return float("-inf")
+            items = sorted(items, key=_score_key, reverse=True)
+
+        dedup = []
+        seen_docs = set()
+        for row in items:
+            doc_id = row["doc_id"]
+            if doc_id in seen_docs:
+                continue
+            seen_docs.add(doc_id)
+            dedup.append(row)
+            if topk_docs is not None and len(dedup) >= topk_docs:
+                break
+
+        normalized = []
+        for i, row in enumerate(dedup, start=1):
+            normalized.append(
+                {
+                    "doc_id": row["doc_id"],
+                    "rank": i,
+                    "score": (float(row["score"]) if row.get("score") is not None else None),
+                    "source_rank": row.get("source_rank"),
+                }
+            )
+        out[qid] = normalized
+
+    logger.info(
+        "Loaded retrieval doc pools from {} for {} qids (avg docs/qid={:.1f})",
+        parquet_path,
+        len(out),
+        sum(len(v) for v in out.values()) / max(len(out), 1),
+    )
+    return out
 
 
 def parse_args():
