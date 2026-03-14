@@ -116,6 +116,7 @@ def generate(
         msg = str(exc).lower()
         retry_signals = (
             "cuda driver error: invalid argument",
+            "cuda out of memory",
             "device-side assert",
             "cublas",
             "cuda error",
