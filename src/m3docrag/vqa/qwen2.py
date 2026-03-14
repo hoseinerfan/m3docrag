@@ -26,6 +26,7 @@ def init(
     dtype=torch.bfloat16,
     bits=16,
     attn_implementation="flash_attention_2",
+    use_fast_processor=None,
     **kwargs,
 ):
     if bits == 4:
@@ -74,9 +75,12 @@ def init(
     )
     model.eval()
     processor_kwargs = {}
+    # Keep Qwen2.5-VL aligned with the known-good path used in prior successful runs.
     if effective_model_type == "qwen2_5_vl":
-        # Slow processor path is more stable for Qwen2.5-VL in this environment.
-        processor_kwargs["use_fast"] = False
+        if use_fast_processor is None:
+            processor_kwargs["use_fast"] = True
+        else:
+            processor_kwargs["use_fast"] = bool(use_fast_processor)
     processor = AutoProcessor.from_pretrained(model_name_or_path, **processor_kwargs)
 
     return {
@@ -93,52 +97,72 @@ def generate(
     if not images:
         return [""]
 
-    # Downscale very large pages to reduce visual-kernel instability.
-    resized_images = []
-    for image in images:
-        if not isinstance(image, Image.Image):
-            resized_images.append(image)
-            continue
-        img = image.convert("RGB")
-        w, h = img.size
-        max_side = 1344
-        if max(w, h) > max_side:
-            scale = max_side / float(max(w, h))
-            img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BICUBIC)
-        resized_images.append(img)
+    def _resize_images(max_side: int):
+        resized = []
+        for image in images:
+            if not isinstance(image, Image.Image):
+                resized.append(image)
+                continue
+            img = image.convert("RGB")
+            w, h = img.size
+            if max(w, h) > max_side:
+                scale = max_side / float(max(w, h))
+                img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BICUBIC)
+            resized.append(img)
+        return resized
 
-    image_content = [{"type": "image", "image": "dummy_content"}] * len(resized_images)
+    def _is_retryable_cuda_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        retry_signals = (
+            "cuda driver error: invalid argument",
+            "device-side assert",
+            "cublas",
+            "cuda error",
+        )
+        return any(token in msg for token in retry_signals)
 
-    messages = [
-        {
-            "role": "user",
-            "content": image_content + [{"type": "text", "text": question}]
-        }
-    ]
-    text = processor.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
-    )
-    # image_inputs, video_inputs = process_vision_info(messages)
-    inputs = processor(
-        text=[text],
-        images=resized_images,
-        # videos=video_inputs,
-        padding=True,
-        return_tensors="pt",
-    )
+    last_exc = None
+    # Retry with progressively smaller images when CUDA kernels are unstable.
+    for max_side in (1344, 1120, 960, 768):
+        resized_images = _resize_images(max_side=max_side)
+        image_content = [{"type": "image", "image": "dummy_content"}] * len(resized_images)
+        messages = [
+            {
+                "role": "user",
+                "content": image_content + [{"type": "text", "text": question}]
+            }
+        ]
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = processor(
+            text=[text],
+            images=resized_images,
+            padding=True,
+            return_tensors="pt",
+        )
 
-    p = next(iter(model.parameters()))
+        p = next(iter(model.parameters()))
+        inputs = inputs.to(p.device)
 
-    inputs = inputs.to(p.device)
+        try:
+            generated_ids = model.generate(**inputs, max_new_tokens=128, do_sample=False)
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            output_text = processor.batch_decode(
+                generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+            )
+            assert isinstance(output_text, list), output_text
+            return output_text
+        except RuntimeError as exc:
+            last_exc = exc
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if _is_retryable_cuda_error(exc) and max_side != 768:
+                continue
+            raise
 
-    # Inference
-    generated_ids = model.generate(**inputs, max_new_tokens=128, do_sample=False)
-    generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-    ]
-    output_text = processor.batch_decode(
-        generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )
-    assert isinstance(output_text, list), output_text
-
-    return output_text
+    if last_exc is not None:
+        raise last_exc
+    return [""]

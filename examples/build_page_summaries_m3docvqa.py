@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -108,6 +109,29 @@ def parse_args():
     )
     p.add_argument("--device", default="cuda")
     p.add_argument("--bits", type=int, default=16, choices=[4, 16])
+    p.add_argument(
+        "--qwen-use-fast-processor",
+        default="auto",
+        choices=["auto", "true", "false"],
+        help="Override Qwen processor speed path. 'auto' keeps model defaults.",
+    )
+    p.add_argument(
+        "--page-max-retries",
+        type=int,
+        default=2,
+        help="Retries per page for transient CUDA/runtime failures.",
+    )
+    p.add_argument(
+        "--page-retry-wait-seconds",
+        type=float,
+        default=1.0,
+        help="Sleep between page retries.",
+    )
+    p.add_argument(
+        "--fail-on-page-error",
+        action="store_true",
+        help="Abort run if a page still fails after retries.",
+    )
     p.add_argument(
         "--prompt",
         default=SUMMARY_PROMPT,
@@ -256,11 +280,21 @@ def build_vqa_model(args) -> VQAModel:
     model_path = _resolve_local_model_path(args.model_name_or_path)
     use_cuda = args.device.startswith("cuda") and torch.cuda.is_available()
     if use_cuda:
-        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        # Qwen-VL has been more reliable with fp16 on this cluster stack.
+        if str(args.model_type).lower() in {"qwen2", "qwen2_5_vl"}:
+            dtype = torch.float16
+        else:
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         attn_impl = "flash_attention_2"
     else:
         dtype = torch.float32
         attn_impl = "eager"
+
+    use_fast_processor = None
+    if args.qwen_use_fast_processor == "true":
+        use_fast_processor = True
+    elif args.qwen_use_fast_processor == "false":
+        use_fast_processor = False
 
     model = VQAModel(
         model_name_or_path=str(model_path),
@@ -268,6 +302,7 @@ def build_vqa_model(args) -> VQAModel:
         dtype=dtype,
         bits=args.bits,
         attn_implementation=attn_impl,
+        use_fast_processor=use_fast_processor,
     )
     # 4-bit models are device-dispatched by accelerate/bitsandbytes and must not be moved via .to().
     if use_cuda and args.bits != 4 and isinstance(model.model, torch.nn.Module):
@@ -280,6 +315,54 @@ def build_vqa_model(args) -> VQAModel:
         args.bits,
     )
     return model
+
+
+def _is_retryable_page_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    retry_signals = (
+        "cuda driver error: invalid argument",
+        "cuda out of memory",
+        "cuda error",
+        "cublas",
+        "device-side assert",
+    )
+    return any(token in msg for token in retry_signals)
+
+
+def _generate_with_retries(
+    *,
+    model: VQAModel,
+    image,
+    prompt: str,
+    page_max_retries: int,
+    page_retry_wait_seconds: float,
+    doc_id: str,
+    page_idx: int,
+) -> str:
+    attempts = max(1, int(page_max_retries) + 1)
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return model.generate(images=[image], question=prompt).strip()
+        except Exception as exc:
+            last_exc = exc
+            retryable = _is_retryable_page_error(exc)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            if attempt >= attempts or not retryable:
+                raise
+            logger.warning(
+                "Retrying page after error | doc_id={} page_idx={} attempt={}/{} | {}",
+                doc_id,
+                page_idx,
+                attempt,
+                attempts,
+                exc,
+            )
+            if page_retry_wait_seconds > 0:
+                time.sleep(page_retry_wait_seconds)
+    assert last_exc is not None
+    raise last_exc
 
 
 def summarize_doc_pages(
@@ -365,16 +448,35 @@ def main():
                 )
 
                 for page_idx in unsummarized_pages:
-                    summary = model.generate(images=[images[page_idx]], question=args.prompt).strip()
-                    row = {
-                        "doc_id": doc_id,
-                        "page_idx": page_idx,
-                        "summary": summary,
-                    }
-                    fout.write(json.dumps(row) + "\n")
-                    fout.flush()
-                    existing_keys.add((doc_id, page_idx))
-                    total_written += 1
+                    try:
+                        summary = _generate_with_retries(
+                            model=model,
+                            image=images[page_idx],
+                            prompt=args.prompt,
+                            page_max_retries=args.page_max_retries,
+                            page_retry_wait_seconds=args.page_retry_wait_seconds,
+                            doc_id=doc_id,
+                            page_idx=page_idx,
+                        )
+                        row = {
+                            "doc_id": doc_id,
+                            "page_idx": page_idx,
+                            "summary": summary,
+                        }
+                        fout.write(json.dumps(row) + "\n")
+                        fout.flush()
+                        existing_keys.add((doc_id, page_idx))
+                        total_written += 1
+                    except Exception as exc:
+                        logger.exception(
+                            "Failed summarizing page | doc_id={} page_idx={} | {}",
+                            doc_id,
+                            page_idx,
+                            exc,
+                        )
+                        if args.fail_on_page_error:
+                            raise
+                        continue
             except Exception as exc:
                 logger.exception("Failed summarizing doc_id={} | {}", doc_id, exc)
 
