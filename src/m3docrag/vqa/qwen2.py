@@ -97,17 +97,18 @@ def generate(
     if not images:
         return [""]
 
-    def _resize_images(max_side: int):
+    def _resize_images(max_side: int | None):
         resized = []
         for image in images:
             if not isinstance(image, Image.Image):
                 resized.append(image)
                 continue
             img = image.convert("RGB")
-            w, h = img.size
-            if max(w, h) > max_side:
-                scale = max_side / float(max(w, h))
-                img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BICUBIC)
+            if max_side is not None:
+                w, h = img.size
+                if max(w, h) > max_side:
+                    scale = max_side / float(max(w, h))
+                    img = img.resize((max(1, int(w * scale)), max(1, int(h * scale))), Image.BICUBIC)
             resized.append(img)
         return resized
 
@@ -123,7 +124,9 @@ def generate(
 
     last_exc = None
     # Retry with progressively smaller images when CUDA kernels are unstable.
-    for max_side in (1344, 1120, 960, 768):
+    # Try original page resolution first (matches prior successful behavior),
+    # then progressively downscale on retry.
+    for max_side in (None, 1536, 1344, 1120, 960, 768):
         resized_images = _resize_images(max_side=max_side)
         image_content = [{"type": "image", "image": "dummy_content"}] * len(resized_images)
         messages = [

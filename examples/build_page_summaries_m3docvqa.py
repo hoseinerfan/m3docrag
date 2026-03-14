@@ -280,11 +280,8 @@ def build_vqa_model(args) -> VQAModel:
     model_path = _resolve_local_model_path(args.model_name_or_path)
     use_cuda = args.device.startswith("cuda") and torch.cuda.is_available()
     if use_cuda:
-        # Qwen-VL has been more reliable with fp16 on this cluster stack.
-        if str(args.model_type).lower() in {"qwen2", "qwen2_5_vl"}:
-            dtype = torch.float16
-        else:
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        # Prefer bf16 on A100/H100 when available; this matched the known-good run.
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         attn_impl = "flash_attention_2"
     else:
         dtype = torch.float32
