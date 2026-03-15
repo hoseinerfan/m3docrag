@@ -4,7 +4,7 @@
 #SBATCH --gres=gpu:a100:1
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=120G
-#SBATCH --time=24:00:00
+#SBATCH --time=48:00:00
 #SBATCH --output=/mmfs1/scratch/jacks.local/aerfanshekooh/newproject/logs/%x_%j.out
 #SBATCH --error=/mmfs1/scratch/jacks.local/aerfanshekooh/newproject/logs/%x_%j.err
 #SBATCH --requeue
