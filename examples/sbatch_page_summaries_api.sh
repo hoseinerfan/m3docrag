@@ -18,6 +18,8 @@ API_KEY_FILE="${API_KEY_FILE:-$ROOT/deepinfrakey}"
 OUT="${OUT:-$ROOT/outputs/page_summaries_dev_full_allpages_qwen25vl32b_api.jsonl}"
 BASE_URL="${BASE_URL:-http://127.0.0.1:8000/v1}"
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen2.5-VL-32B-Instruct}"
+PY_VLLM="${PY_VLLM:-$ROOT/.conda/vllm_server/bin/python}"
+PY_CLIENT="${PY_CLIENT:-$ROOT/.conda/m3docrag/bin/python}"
 
 mkdir -p "$ROOT/logs" "$(dirname "$OUT")"
 if [[ ! -s "$API_KEY_FILE" ]]; then
@@ -25,10 +27,16 @@ if [[ ! -s "$API_KEY_FILE" ]]; then
   chmod 600 "$API_KEY_FILE"
 fi
 
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate "$ROOT/.conda/vllm_server"
+if [[ ! -x "$PY_VLLM" ]]; then
+  echo "Missing vLLM python executable: $PY_VLLM" >&2
+  exit 127
+fi
+if [[ ! -x "$PY_CLIENT" ]]; then
+  echo "Missing client python executable: $PY_CLIENT" >&2
+  exit 127
+fi
 
-python -m vllm.entrypoints.openai.api_server \
+"$PY_VLLM" -m vllm.entrypoints.openai.api_server \
   --host 127.0.0.1 \
   --port 8000 \
   --model "$M2" \
@@ -51,8 +59,7 @@ for _ in $(seq 1 120); do
 done
 curl -fsS "${BASE_URL%/v1}/health" >/dev/null
 
-conda activate "$ROOT/.conda/m3docrag"
-python "$ROOT/m3docrag/examples/build_page_summaries_vllm_api.py" \
+"$PY_CLIENT" "$ROOT/m3docrag/examples/build_page_summaries_vllm_api.py" \
   --split dev \
   --pdf-dir "$PDF_DIR" \
   --all-docs-in-pdf-dir \
