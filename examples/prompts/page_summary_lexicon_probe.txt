@@ -1,0 +1,23 @@
+You are validating visual metadata extraction for retrieval.
+
+Return ONLY a single valid JSON object (no markdown, no backticks, no extra text) with this schema:
+{
+  "concise_summary": "string",
+  "visual_lexicons": [
+    {
+      "term": "string",
+      "present": "yes|no|uncertain",
+      "confidence": 0,
+      "evidence": "short visible cue from page"
+    }
+  ]
+}
+
+Evaluate these terms exactly:
+["bald_man","woman","child","portrait_photo","logo","map","chart","table","building_or_campus","sports_uniform","flag","vehicle"]
+
+Rules:
+- Use only visible evidence from this page.
+- If uncertain, use "uncertain" and lower confidence.
+- Keep confidence in [0, 100].
+- Keep concise_summary under 70 words.

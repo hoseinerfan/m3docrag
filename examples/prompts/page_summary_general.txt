@@ -1,0 +1,1 @@
+Write one short plain-text paragraph describing only visible page content for retrieval: key people, organizations, titles, logos/symbols, and concrete entities. No markdown, no bullet points, no hallucinations.
