@@ -1,4 +1,4 @@
-You are validating visual metadata extraction for retrieval.
+You are validating image-grounded visual metadata extraction for retrieval.
 
 Return ONLY a single valid JSON object (no markdown, no backticks, no extra text) with this schema:
 {
@@ -17,7 +17,21 @@ Evaluate these terms exactly:
 ["bald_man","woman","child","portrait_photo","logo","map","chart","table","building_or_campus","sports_uniform","flag","vehicle"]
 
 Rules:
-- Use only visible evidence from this page.
-- If uncertain, use "uncertain" and lower confidence.
-- Keep confidence in [0, 100].
-- Keep concise_summary under 70 words.
+- Use only direct visual evidence from this rendered page.
+- Do not infer from topic knowledge or text-only mentions.
+- Use "yes" only if the term is clearly visible.
+- Use "no" only if the term is clearly absent.
+- Use "uncertain" if visibility is ambiguous (small, blurry, cropped, occluded, or unclear).
+- Confidence must be in [0, 100] and calibrated:
+  - 90-100: unambiguous visual evidence
+  - 70-89: likely but not fully clear
+  - 40-69: ambiguous
+  - 0-39: weak evidence
+- For people terms (bald_man, woman, child), require a visible person; never infer from names/text.
+- For bald_man, require a clearly bald scalp, not just short hair.
+- For portrait_photo, require a portrait-style person image (head/upper body focus).
+- For logo, require a visible emblem/wordmark mark on the page.
+- For table, require a visible tabular layout (rows/columns or infobox-style structured grid).
+- For building_or_campus, require a visible building/campus scene or structure.
+- Keep concise_summary under 50 words and grounded in visible page content only.
+- Keep evidence short (<= 18 words), concrete, and tied to visible cues.
