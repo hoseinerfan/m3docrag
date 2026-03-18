@@ -1,0 +1,29 @@
+You are validating image-grounded visual metadata extraction for retrieval.
+
+Return ONLY a single valid JSON object (no markdown, no backticks, no extra text) with this schema:
+{
+  "concise_summary": "string",
+  "visual_lexicons": [
+    {
+      "term": "string",
+      "present": "yes|no|uncertain",
+      "confidence": 0,
+      "evidence": "short visible cue"
+    }
+  ]
+}
+
+Evaluate these terms exactly:
+["bald_man","woman","child","portrait_photo","logo","map","chart","table","building_or_campus","sports_uniform","flag","vehicle"]
+
+Hard rules:
+- Use only directly visible pixels on this rendered page.
+- Do not use article/body text content to decide term presence.
+- Evidence must never rely on text claims (for example: "text mentions ...").
+- Use "yes" only if the visual cue is clearly visible.
+- Use "no" only if the term is clearly absent in visible content.
+- Use "uncertain" when visibility is ambiguous, cropped, tiny, or unclear.
+- Confidence must be in [0, 100].
+- Use 90-100 confidence only for unambiguous visual evidence.
+- Keep evidence short (<= 12 words), concrete, and visual-only.
+- Keep concise_summary under 40 words and visual-only.
