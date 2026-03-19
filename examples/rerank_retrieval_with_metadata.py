@@ -9,9 +9,12 @@ import json
 import math
 import re
 import statistics
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Optional
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 
 def _parse_args() -> argparse.Namespace:
@@ -74,6 +77,65 @@ def _parse_args() -> argparse.Namespace:
         "--no-demotion",
         action="store_true",
         help="Never allow metadata to lower a candidate below its base-score-only value.",
+    )
+    p.add_argument(
+        "--llm-rerank",
+        action="store_true",
+        help="Use an LLM to rerank candidates inside the configured rerank window.",
+    )
+    p.add_argument(
+        "--llm-base-url",
+        type=str,
+        default=None,
+        help="OpenAI-compatible base URL (for example http://127.0.0.1:8010/v1).",
+    )
+    p.add_argument(
+        "--llm-model",
+        type=str,
+        default=None,
+        help="Model name used for LLM reranking.",
+    )
+    p.add_argument(
+        "--llm-api-key-file",
+        type=Path,
+        default=None,
+        help="Optional API key file for LLM reranking.",
+    )
+    p.add_argument(
+        "--llm-window-max-candidates",
+        type=int,
+        default=30,
+        help="Maximum candidates from rerank window shown to LLM.",
+    )
+    p.add_argument(
+        "--llm-summary-max-chars",
+        type=int,
+        default=280,
+        help="Max summary chars per candidate sent to LLM.",
+    )
+    p.add_argument(
+        "--llm-max-retries",
+        type=int,
+        default=2,
+        help="Retry attempts for each LLM rerank call.",
+    )
+    p.add_argument(
+        "--llm-timeout-s",
+        type=float,
+        default=60.0,
+        help="HTTP timeout in seconds for LLM rerank call.",
+    )
+    p.add_argument(
+        "--llm-max-tokens",
+        type=int,
+        default=512,
+        help="Max completion tokens for LLM rerank call.",
+    )
+    p.add_argument(
+        "--llm-temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for LLM rerank call.",
     )
     p.add_argument("--summary-ks", type=str, default="1,2,4,10,20,50,100,500")
     return p.parse_args()
@@ -723,9 +785,213 @@ def _window_bounds(
     return (start, end)
 
 
+def _read_api_key(path: Path | None) -> str:
+    if path is None:
+        return ""
+    if not path.exists():
+        return ""
+    key = path.read_text().strip()
+    return key
+
+
+def _chat_completions_url(base_url: str) -> str:
+    u = str(base_url).strip()
+    if u.endswith("/chat/completions"):
+        return u
+    return u.rstrip("/") + "/chat/completions"
+
+
+def _build_llm_rerank_prompt(
+    *,
+    query: str,
+    rows: list[dict[str, Any]],
+    summary_max_chars: int,
+) -> str:
+    lines = []
+    for i, row in enumerate(rows, start=1):
+        summary = _norm_text(str(row.get("summary_text", "")))[: max(1, int(summary_max_chars))]
+        lines.append(
+            f"[{i}] doc_id={row['doc_id']} page_idx={int(row['page_idx'])} "
+            f"base_score={float(row['base_score']):.6f} summary={summary}"
+        )
+    joined = "\n".join(lines)
+    return (
+        "You are a retrieval reranker.\n"
+        "Given the query and candidate page summaries, reorder candidates from most relevant to least relevant.\n"
+        "Favor candidates with direct evidence for answering the query.\n\n"
+        f"QUERY:\n{_norm_text(query)}\n\n"
+        "CANDIDATES:\n"
+        f"{joined}\n\n"
+        "Return JSON only:\n"
+        "{\n"
+        '  "ordered_candidate_indices": [1, 2, 3]\n'
+        "}\n"
+        "Rules:\n"
+        "- Use candidate indices shown above.\n"
+        "- Do not invent new indices.\n"
+        "- Include each chosen index at most once.\n"
+    )
+
+
+def _extract_ordered_indices(raw_reply: str, max_index: int) -> list[int]:
+    if not raw_reply:
+        return []
+    payload = _extract_first_json_object(raw_reply)
+    values = None
+    if isinstance(payload, dict):
+        for key in (
+            "ordered_candidate_indices",
+            "ordered_indices",
+            "order",
+            "ranking",
+            "selected",
+            "selected_indices",
+        ):
+            val = payload.get(key)
+            if isinstance(val, list):
+                values = val
+                break
+    out: list[int] = []
+    seen: set[int] = set()
+
+    def _push(idx_val: Any) -> None:
+        try:
+            idx = int(idx_val)
+        except Exception:
+            return
+        if idx < 1 or idx > max_index:
+            return
+        if idx in seen:
+            return
+        seen.add(idx)
+        out.append(idx)
+
+    if isinstance(values, list):
+        for item in values:
+            if isinstance(item, dict):
+                _push(item.get("candidate_index"))
+            else:
+                _push(item)
+    else:
+        for m in re.findall(r"\d+", raw_reply):
+            _push(m)
+    return out
+
+
+def _reorder_rows_by_indices(rows: list[dict[str, Any]], ordered_indices: list[int]) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    if not ordered_indices:
+        return list(rows)
+    by_idx = {i: row for i, row in enumerate(rows, start=1)}
+    out: list[dict[str, Any]] = []
+    used: set[int] = set()
+    for idx in ordered_indices:
+        row = by_idx.get(idx)
+        if row is None or idx in used:
+            continue
+        out.append(row)
+        used.add(idx)
+    for i, row in enumerate(rows, start=1):
+        if i in used:
+            continue
+        out.append(row)
+    return out
+
+
+def _call_llm_rerank_once(
+    *,
+    base_url: str,
+    model: str,
+    api_key: str,
+    prompt: str,
+    timeout_s: float,
+    max_tokens: int,
+    temperature: float,
+) -> str:
+    url = _chat_completions_url(base_url)
+    payload = {
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens),
+    }
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    req = urlrequest.Request(
+        url=url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urlrequest.urlopen(req, timeout=float(timeout_s)) as resp:
+        body = resp.read().decode("utf-8")
+    obj = json.loads(body)
+    return str(((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+
+
+def _llm_rerank_rows(
+    *,
+    query: str,
+    rows: list[dict[str, Any]],
+    base_url: str,
+    model: str,
+    api_key: str,
+    summary_max_chars: int,
+    max_retries: int,
+    timeout_s: float,
+    max_tokens: int,
+    temperature: float,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    trace = {
+        "enabled": True,
+        "attempted": False,
+        "success": False,
+        "selected_count": 0,
+        "error": None,
+        "raw_reply_preview": None,
+    }
+    if not rows:
+        return rows, trace
+    prompt = _build_llm_rerank_prompt(query=query, rows=rows, summary_max_chars=summary_max_chars)
+    attempts = max(1, int(max_retries))
+    for attempt in range(1, attempts + 1):
+        trace["attempted"] = True
+        try:
+            raw = _call_llm_rerank_once(
+                base_url=base_url,
+                model=model,
+                api_key=api_key,
+                prompt=prompt,
+                timeout_s=timeout_s,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            trace["raw_reply_preview"] = _norm_text(raw)[:400]
+            indices = _extract_ordered_indices(raw, max_index=len(rows))
+            if indices:
+                trace["success"] = True
+                trace["selected_count"] = len(indices)
+                return _reorder_rows_by_indices(rows, indices), trace
+            trace["error"] = "empty_or_unparseable_order"
+        except (urlerror.URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            trace["error"] = str(exc)
+        if attempt < attempts:
+            time.sleep(0.6 * attempt)
+    return rows, trace
+
+
 def main() -> int:
     args = _parse_args()
     summary_ks = _parse_summary_ks(args.summary_ks)
+    llm_api_key = _read_api_key(args.llm_api_key_file)
+    if args.llm_rerank:
+        if not args.llm_base_url:
+            raise ValueError("--llm-rerank requires --llm-base-url")
+        if not args.llm_model:
+            raise ValueError("--llm-rerank requires --llm-model")
 
     qid_filter = {args.qid} if args.qid else None
     qids_allow = _load_qids_file(args.qids_file)
@@ -801,6 +1067,7 @@ def main() -> int:
                 "base_score": base_score,
                 "summary_score": float(summary_score),
                 "visual_score": float(visual_score),
+                "summary_text": summary_text or "",
             }
             scored.append(rec)
             base_vals.append(base_score)
@@ -839,9 +1106,42 @@ def main() -> int:
             window = scored[start_rank - 1 : end_rank]
             suffix = scored[end_rank:]
             window = sorted(window, key=lambda r: r["final_score"], reverse=True)
+            llm_trace = {
+                "enabled": bool(args.llm_rerank),
+                "attempted": False,
+                "success": False,
+                "selected_count": 0,
+                "error": None,
+                "raw_reply_preview": None,
+            }
+            if args.llm_rerank and window:
+                max_cands = max(1, int(args.llm_window_max_candidates))
+                head = window[:max_cands]
+                tail = window[max_cands:]
+                head, llm_trace = _llm_rerank_rows(
+                    query=query,
+                    rows=head,
+                    base_url=str(args.llm_base_url),
+                    model=str(args.llm_model),
+                    api_key=llm_api_key,
+                    summary_max_chars=int(args.llm_summary_max_chars),
+                    max_retries=int(args.llm_max_retries),
+                    timeout_s=float(args.llm_timeout_s),
+                    max_tokens=int(args.llm_max_tokens),
+                    temperature=float(args.llm_temperature),
+                )
+                window = head + tail
             reranked = prefix + window + suffix
         else:
             reranked = list(scored)
+            llm_trace = {
+                "enabled": bool(args.llm_rerank),
+                "attempted": False,
+                "success": False,
+                "selected_count": 0,
+                "error": None,
+                "raw_reply_preview": None,
+            }
 
         save_rows = reranked[: args.save_top_k]
         reranked_top_pages[qid] = [
@@ -896,6 +1196,7 @@ def main() -> int:
             "window_end_rank": int(args.window_end_rank),
             "boost_only": bool(args.boost_only),
             "no_demotion": bool(args.no_demotion),
+            "llm_rerank_trace": llm_trace,
             "visual_min_confidence": float(args.visual_min_confidence),
         }
 
@@ -921,6 +1222,16 @@ def main() -> int:
             "window_end_rank": int(args.window_end_rank),
             "boost_only": bool(args.boost_only),
             "no_demotion": bool(args.no_demotion),
+            "llm_rerank": bool(args.llm_rerank),
+            "llm_base_url": args.llm_base_url,
+            "llm_model": args.llm_model,
+            "llm_api_key_file": None if args.llm_api_key_file is None else str(args.llm_api_key_file),
+            "llm_window_max_candidates": int(args.llm_window_max_candidates),
+            "llm_summary_max_chars": int(args.llm_summary_max_chars),
+            "llm_max_retries": int(args.llm_max_retries),
+            "llm_timeout_s": float(args.llm_timeout_s),
+            "llm_max_tokens": int(args.llm_max_tokens),
+            "llm_temperature": float(args.llm_temperature),
             "qids_file": None if args.qids_file is None else str(args.qids_file),
             "max_qids": args.max_qids,
             "summary_ks": summary_ks,
