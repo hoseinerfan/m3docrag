@@ -47,6 +47,34 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--visual-weight", type=float, default=1.1)
     p.add_argument("--visual-min-confidence", type=float, default=0.4)
     p.add_argument("--visual-uncertain-multiplier", type=float, default=0.35)
+    p.add_argument(
+        "--freeze-top-n",
+        type=int,
+        default=0,
+        help="Keep top-N baseline ranks fixed before any reranking is applied.",
+    )
+    p.add_argument(
+        "--window-start-rank",
+        type=int,
+        default=1,
+        help="1-based rank where reranking window starts (inclusive).",
+    )
+    p.add_argument(
+        "--window-end-rank",
+        type=int,
+        default=0,
+        help="1-based rank where reranking window ends (inclusive). 0 means up to topk-candidates.",
+    )
+    p.add_argument(
+        "--boost-only",
+        action="store_true",
+        help="Apply metadata as positive boost only (never subtract).",
+    )
+    p.add_argument(
+        "--no-demotion",
+        action="store_true",
+        help="Never allow metadata to lower a candidate below its base-score-only value.",
+    )
     p.add_argument("--summary-ks", type=str, default="1,2,4,10,20,50,100,500")
     return p.parse_args()
 
@@ -681,6 +709,20 @@ def _summary_from_diagnostics(diagnostics: dict[str, dict[str, Any]], ks: list[i
     return out
 
 
+def _window_bounds(
+    n_rows: int,
+    *,
+    freeze_top_n: int,
+    window_start_rank: int,
+    window_end_rank: int,
+) -> tuple[int, int]:
+    if n_rows <= 0:
+        return (1, 0)
+    start = max(1, int(window_start_rank), int(freeze_top_n) + 1)
+    end = n_rows if int(window_end_rank) <= 0 else min(n_rows, int(window_end_rank))
+    return (start, end)
+
+
 def main() -> int:
     args = _parse_args()
     summary_ks = _parse_summary_ks(args.summary_ks)
@@ -772,13 +814,35 @@ def main() -> int:
             rec["base_z"] = float(bz[i])
             rec["summary_z"] = float(sz[i])
             rec["visual_z"] = float(vz[i])
-            rec["final_score"] = float(
-                (float(args.base_weight) * rec["base_z"])
-                + (float(args.summary_weight) * rec["summary_z"])
+            base_component = float(args.base_weight) * rec["base_z"]
+            meta_component = (
+                (float(args.summary_weight) * rec["summary_z"])
                 + (float(args.visual_weight) * rec["visual_z"])
             )
+            if args.boost_only:
+                meta_component = max(meta_component, 0.0)
+            final_score = base_component + meta_component
+            if args.no_demotion:
+                final_score = max(final_score, base_component)
+            rec["base_component"] = float(base_component)
+            rec["meta_component"] = float(meta_component)
+            rec["final_score"] = float(final_score)
 
-        reranked = sorted(scored, key=lambda r: r["final_score"], reverse=True)
+        start_rank, end_rank = _window_bounds(
+            len(scored),
+            freeze_top_n=int(args.freeze_top_n),
+            window_start_rank=int(args.window_start_rank),
+            window_end_rank=int(args.window_end_rank),
+        )
+        if start_rank <= end_rank:
+            prefix = scored[: start_rank - 1]
+            window = scored[start_rank - 1 : end_rank]
+            suffix = scored[end_rank:]
+            window = sorted(window, key=lambda r: r["final_score"], reverse=True)
+            reranked = prefix + window + suffix
+        else:
+            reranked = list(scored)
+
         save_rows = reranked[: args.save_top_k]
         reranked_top_pages[qid] = [
             {
@@ -791,6 +855,8 @@ def main() -> int:
                 "base_z": float(r["base_z"]),
                 "summary_z": float(r["summary_z"]),
                 "visual_z": float(r["visual_z"]),
+                "base_component": float(r["base_component"]),
+                "meta_component": float(r["meta_component"]),
             }
             for r in save_rows
         ]
@@ -825,6 +891,11 @@ def main() -> int:
                 "summary_weight": float(args.summary_weight),
                 "visual_weight": float(args.visual_weight),
             },
+            "freeze_top_n": int(args.freeze_top_n),
+            "window_start_rank": int(args.window_start_rank),
+            "window_end_rank": int(args.window_end_rank),
+            "boost_only": bool(args.boost_only),
+            "no_demotion": bool(args.no_demotion),
             "visual_min_confidence": float(args.visual_min_confidence),
         }
 
@@ -845,6 +916,11 @@ def main() -> int:
             "visual_weight": float(args.visual_weight),
             "visual_min_confidence": float(args.visual_min_confidence),
             "visual_uncertain_multiplier": float(args.visual_uncertain_multiplier),
+            "freeze_top_n": int(args.freeze_top_n),
+            "window_start_rank": int(args.window_start_rank),
+            "window_end_rank": int(args.window_end_rank),
+            "boost_only": bool(args.boost_only),
+            "no_demotion": bool(args.no_demotion),
             "qids_file": None if args.qids_file is None else str(args.qids_file),
             "max_qids": args.max_qids,
             "summary_ks": summary_ks,
