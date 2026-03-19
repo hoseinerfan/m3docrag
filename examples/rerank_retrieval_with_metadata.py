@@ -38,6 +38,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--qrels-page-col", type=str, default=None)
     p.add_argument("--qid", type=str, default=None, help="Optional single qid.")
     p.add_argument("--query", type=str, default=None, help="Optional query text for --qid.")
+    p.add_argument("--qids-file", type=Path, default=None, help="Optional newline-separated qid allowlist.")
+    p.add_argument("--max-qids", type=int, default=None, help="Optional cap after filtering/sorting qids.")
     p.add_argument("--topk-candidates", type=int, default=1000)
     p.add_argument("--save-top-k", type=int, default=1000)
     p.add_argument("--base-weight", type=float, default=1.0)
@@ -265,6 +267,18 @@ def _load_qid2query(mmqa_jsonl: Path | None) -> dict[str, str]:
             if qid is None or q is None:
                 continue
             out[str(qid)] = str(q)
+    return out
+
+
+def _load_qids_file(path: Path | None) -> set[str] | None:
+    if path is None:
+        return None
+    out: set[str] = set()
+    with path.open() as f:
+        for line in f:
+            q = line.strip()
+            if q:
+                out.add(q)
     return out
 
 
@@ -672,6 +686,7 @@ def main() -> int:
     summary_ks = _parse_summary_ks(args.summary_ks)
 
     qid_filter = {args.qid} if args.qid else None
+    qids_allow = _load_qids_file(args.qids_file)
     qid2pages = _load_retrieval_parquet(
         parquet_path=args.retrieval_parquet,
         qid_filter=qid_filter,
@@ -698,6 +713,10 @@ def main() -> int:
         qids = [args.qid]
     else:
         qids = sorted(qid2pages.keys())
+        if qids_allow is not None:
+            qids = [q for q in qids if q in qids_allow]
+        if args.max_qids is not None:
+            qids = qids[: max(0, int(args.max_qids))]
     if not qids:
         raise ValueError("No qids to rerank")
 
@@ -826,6 +845,8 @@ def main() -> int:
             "visual_weight": float(args.visual_weight),
             "visual_min_confidence": float(args.visual_min_confidence),
             "visual_uncertain_multiplier": float(args.visual_uncertain_multiplier),
+            "qids_file": None if args.qids_file is None else str(args.qids_file),
+            "max_qids": args.max_qids,
             "summary_ks": summary_ks,
         },
         "top_docs": reranked_top_docs,
