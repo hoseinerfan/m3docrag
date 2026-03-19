@@ -807,17 +807,49 @@ def _build_llm_rerank_prompt(
     rows: list[dict[str, Any]],
     summary_max_chars: int,
 ) -> str:
+    def _visual_brief(terms: Optional[dict[str, tuple[str, float]]]) -> str:
+        if not terms:
+            return "none"
+        yes = []
+        uncertain = []
+        for term, state_conf in terms.items():
+            if not isinstance(state_conf, tuple) or len(state_conf) != 2:
+                continue
+            state, conf = state_conf
+            s = str(state).strip().lower()
+            try:
+                c = float(conf)
+            except Exception:
+                c = 0.0
+            if s == "yes":
+                yes.append((str(term), c))
+            elif s == "uncertain":
+                uncertain.append((str(term), c))
+        yes.sort(key=lambda z: z[1], reverse=True)
+        uncertain.sort(key=lambda z: z[1], reverse=True)
+        parts = []
+        if yes:
+            parts.append(
+                "yes=" + ",".join(f"{t}({c:.2f})" for t, c in yes[:6])
+            )
+        if uncertain:
+            parts.append(
+                "uncertain=" + ",".join(f"{t}({c:.2f})" for t, c in uncertain[:4])
+            )
+        return "; ".join(parts) if parts else "none"
+
     lines = []
     for i, row in enumerate(rows, start=1):
         summary = _norm_text(str(row.get("summary_text", "")))[: max(1, int(summary_max_chars))]
+        visual_brief = _visual_brief(row.get("visual_terms"))
         lines.append(
             f"[{i}] doc_id={row['doc_id']} page_idx={int(row['page_idx'])} "
-            f"base_score={float(row['base_score']):.6f} summary={summary}"
+            f"base_score={float(row['base_score']):.6f} summary={summary} visual={visual_brief}"
         )
     joined = "\n".join(lines)
     return (
         "You are a retrieval reranker.\n"
-        "Given the query and candidate page summaries, reorder candidates from most relevant to least relevant.\n"
+        "Given the query, candidate page summaries, and visual lexicon cues, reorder candidates from most relevant to least relevant.\n"
         "Favor candidates with direct evidence for answering the query.\n\n"
         f"QUERY:\n{_norm_text(query)}\n\n"
         "CANDIDATES:\n"
@@ -1068,6 +1100,7 @@ def main() -> int:
                 "summary_score": float(summary_score),
                 "visual_score": float(visual_score),
                 "summary_text": summary_text or "",
+                "visual_terms": visual_terms or {},
             }
             scored.append(rec)
             base_vals.append(base_score)
