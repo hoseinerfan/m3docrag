@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J pgsum_qw_shard
 #SBATCH -p gpu
-#SBATCH --gres=gpu:a100:1
+#SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=12
 #SBATCH --mem=96G
 #SBATCH --time=48:00:00
