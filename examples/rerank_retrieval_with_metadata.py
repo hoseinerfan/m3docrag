@@ -137,6 +137,65 @@ def _parse_args() -> argparse.Namespace:
         default=0.0,
         help="Sampling temperature for LLM rerank call.",
     )
+    p.add_argument(
+        "--rewrite-query",
+        action="store_true",
+        help="Enable query-rewrite stage before second-pass reranking.",
+    )
+    p.add_argument(
+        "--rewrite-base-url",
+        type=str,
+        default=None,
+        help="OpenAI-compatible base URL for query rewrite. Defaults to --llm-base-url.",
+    )
+    p.add_argument(
+        "--rewrite-model",
+        type=str,
+        default=None,
+        help="Model for query rewrite. Defaults to --llm-model.",
+    )
+    p.add_argument(
+        "--rewrite-api-key-file",
+        type=Path,
+        default=None,
+        help="Optional API key file for query rewrite. Defaults to --llm-api-key-file.",
+    )
+    p.add_argument(
+        "--rewrite-context-candidates",
+        type=int,
+        default=20,
+        help="Number of top baseline candidates used as context for query rewrite.",
+    )
+    p.add_argument(
+        "--rewrite-summary-max-chars",
+        type=int,
+        default=180,
+        help="Max summary chars per candidate sent to query rewriter.",
+    )
+    p.add_argument(
+        "--rewrite-max-retries",
+        type=int,
+        default=2,
+        help="Retry attempts for each query-rewrite call.",
+    )
+    p.add_argument(
+        "--rewrite-timeout-s",
+        type=float,
+        default=60.0,
+        help="HTTP timeout in seconds for query rewrite call.",
+    )
+    p.add_argument(
+        "--rewrite-max-tokens",
+        type=int,
+        default=128,
+        help="Max completion tokens for query rewrite call.",
+    )
+    p.add_argument(
+        "--rewrite-temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for query rewrite call.",
+    )
     p.add_argument("--summary-ks", type=str, default="1,2,4,10,20,50,100,500")
     return p.parse_args()
 
@@ -964,6 +1023,105 @@ def _call_llm_rerank_once(
     return str(((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
 
 
+def _build_query_rewrite_prompt(
+    *,
+    query: str,
+    rows: list[dict[str, Any]],
+    summary_max_chars: int,
+) -> str:
+    lines = []
+    for i, row in enumerate(rows, start=1):
+        summary = _norm_text(str(row.get("summary_text", "")))[: max(1, int(summary_max_chars))]
+        lines.append(
+            f"[{i}] doc_id={row['doc_id']} page_idx={int(row['page_idx'])} "
+            f"base_score={float(row['base_score']):.6f} summary={summary}"
+        )
+    joined = "\n".join(lines)
+    return (
+        "You rewrite retrieval queries for document QA.\n"
+        "Goal: preserve original intent, but add discriminative keywords so retrieval finds evidence pages.\n"
+        "Do not broaden the question; keep answer target unchanged.\n\n"
+        f"ORIGINAL_QUERY:\n{_norm_text(query)}\n\n"
+        "TOP_CANDIDATE_SUMMARIES:\n"
+        f"{joined}\n\n"
+        "Return JSON only:\n"
+        "{\n"
+        '  "rewritten_query": "<text>"\n'
+        "}\n"
+        "Rules:\n"
+        "- Keep semantics equivalent to ORIGINAL_QUERY.\n"
+        "- Add specific entities/aliases/terms only if supported by candidate summaries.\n"
+        "- One sentence only.\n"
+    )
+
+
+def _extract_rewritten_query(raw_reply: str, original_query: str) -> str:
+    if not raw_reply:
+        return _norm_text(original_query)
+    payload = _extract_first_json_object(raw_reply)
+    if isinstance(payload, dict):
+        for k in ("rewritten_query", "query", "rewrite"):
+            v = payload.get(k)
+            if isinstance(v, str) and v.strip():
+                return _norm_text(v)
+    first = _norm_text(raw_reply)
+    if first:
+        return first
+    return _norm_text(original_query)
+
+
+def _rewrite_query_with_llm(
+    *,
+    original_query: str,
+    rows: list[dict[str, Any]],
+    base_url: str,
+    model: str,
+    api_key: str,
+    summary_max_chars: int,
+    max_retries: int,
+    timeout_s: float,
+    max_tokens: int,
+    temperature: float,
+) -> tuple[str, dict[str, Any]]:
+    trace = {
+        "enabled": True,
+        "attempted": False,
+        "success": False,
+        "error": None,
+        "raw_reply_preview": None,
+    }
+    if not rows:
+        return _norm_text(original_query), trace
+    prompt = _build_query_rewrite_prompt(
+        query=original_query,
+        rows=rows,
+        summary_max_chars=summary_max_chars,
+    )
+    attempts = max(1, int(max_retries))
+    for attempt in range(1, attempts + 1):
+        trace["attempted"] = True
+        try:
+            raw = _call_llm_rerank_once(
+                base_url=base_url,
+                model=model,
+                api_key=api_key,
+                prompt=prompt,
+                timeout_s=timeout_s,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            trace["raw_reply_preview"] = _norm_text(raw)[:400]
+            rewritten = _extract_rewritten_query(raw, original_query)
+            if rewritten and rewritten.casefold() != _norm_text(original_query).casefold():
+                trace["success"] = True
+            return rewritten, trace
+        except (urlerror.URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            trace["error"] = str(exc)
+        if attempt < attempts:
+            time.sleep(0.6 * attempt)
+    return _norm_text(original_query), trace
+
+
 def _llm_rerank_rows(
     *,
     query: str,
@@ -1019,11 +1177,19 @@ def main() -> int:
     args = _parse_args()
     summary_ks = _parse_summary_ks(args.summary_ks)
     llm_api_key = _read_api_key(args.llm_api_key_file)
+    rewrite_api_key = _read_api_key(args.rewrite_api_key_file) if args.rewrite_api_key_file else llm_api_key
     if args.llm_rerank:
         if not args.llm_base_url:
             raise ValueError("--llm-rerank requires --llm-base-url")
         if not args.llm_model:
             raise ValueError("--llm-rerank requires --llm-model")
+    if args.rewrite_query:
+        rewrite_base_url = args.rewrite_base_url or args.llm_base_url
+        rewrite_model = args.rewrite_model or args.llm_model
+        if not rewrite_base_url:
+            raise ValueError("--rewrite-query requires --rewrite-base-url or --llm-base-url")
+        if not rewrite_model:
+            raise ValueError("--rewrite-query requires --rewrite-model or --llm-model")
 
     qid_filter = {args.qid} if args.qid else None
     qids_allow = _load_qids_file(args.qids_file)
@@ -1065,9 +1231,10 @@ def main() -> int:
     diagnostics: dict[str, dict[str, Any]] = {}
 
     for qid in qids:
-        query = args.query if (args.qid == qid and args.query is not None) else qid2query.get(qid)
-        if query is None:
+        original_query = args.query if (args.qid == qid and args.query is not None) else qid2query.get(qid)
+        if original_query is None:
             raise ValueError(f"No query text for qid={qid}. Provide --mmqa-jsonl or --query with --qid.")
+        query = _norm_text(original_query)
 
         cands = qid2pages[qid][: args.topk_candidates]
         if not cands:
@@ -1075,6 +1242,41 @@ def main() -> int:
             reranked_top_docs[qid] = []
             diagnostics[qid] = {"n_candidates": 0}
             continue
+
+        rewrite_trace = {
+            "enabled": bool(args.rewrite_query),
+            "attempted": False,
+            "success": False,
+            "error": None,
+            "raw_reply_preview": None,
+        }
+        if args.rewrite_query:
+            rewrite_rows = []
+            for row in cands[: max(1, int(args.rewrite_context_candidates))]:
+                d = str(row["doc_id"])
+                p = int(row["page_idx"])
+                rewrite_rows.append(
+                    {
+                        "doc_id": d,
+                        "page_idx": p,
+                        "base_score": float(row["score"]),
+                        "summary_text": _lookup_context(base_context_map, d, p) or "",
+                    }
+                )
+            rewrite_base_url = str(args.rewrite_base_url or args.llm_base_url)
+            rewrite_model = str(args.rewrite_model or args.llm_model)
+            query, rewrite_trace = _rewrite_query_with_llm(
+                original_query=_norm_text(original_query),
+                rows=rewrite_rows,
+                base_url=rewrite_base_url,
+                model=rewrite_model,
+                api_key=rewrite_api_key,
+                summary_max_chars=int(args.rewrite_summary_max_chars),
+                max_retries=int(args.rewrite_max_retries),
+                timeout_s=float(args.rewrite_timeout_s),
+                max_tokens=int(args.rewrite_max_tokens),
+                temperature=float(args.rewrite_temperature),
+            )
 
         scored: list[dict[str, Any]] = []
         base_vals: list[float] = []
@@ -1224,6 +1426,9 @@ def main() -> int:
                 "summary_weight": float(args.summary_weight),
                 "visual_weight": float(args.visual_weight),
             },
+            "original_query": _norm_text(original_query),
+            "effective_query": _norm_text(query),
+            "query_rewrite_trace": rewrite_trace,
             "freeze_top_n": int(args.freeze_top_n),
             "window_start_rank": int(args.window_start_rank),
             "window_end_rank": int(args.window_end_rank),
@@ -1265,6 +1470,16 @@ def main() -> int:
             "llm_timeout_s": float(args.llm_timeout_s),
             "llm_max_tokens": int(args.llm_max_tokens),
             "llm_temperature": float(args.llm_temperature),
+            "rewrite_query": bool(args.rewrite_query),
+            "rewrite_base_url": args.rewrite_base_url,
+            "rewrite_model": args.rewrite_model,
+            "rewrite_api_key_file": None if args.rewrite_api_key_file is None else str(args.rewrite_api_key_file),
+            "rewrite_context_candidates": int(args.rewrite_context_candidates),
+            "rewrite_summary_max_chars": int(args.rewrite_summary_max_chars),
+            "rewrite_max_retries": int(args.rewrite_max_retries),
+            "rewrite_timeout_s": float(args.rewrite_timeout_s),
+            "rewrite_max_tokens": int(args.rewrite_max_tokens),
+            "rewrite_temperature": float(args.rewrite_temperature),
             "qids_file": None if args.qids_file is None else str(args.qids_file),
             "max_qids": args.max_qids,
             "summary_ks": summary_ks,
