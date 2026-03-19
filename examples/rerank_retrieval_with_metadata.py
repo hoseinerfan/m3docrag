@@ -10,7 +10,7 @@ import math
 import re
 import statistics
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any, Optional
 from urllib import error as urlerror
@@ -195,6 +195,44 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.0,
         help="Sampling temperature for query rewrite call.",
+    )
+    p.add_argument(
+        "--iterative-retrieval",
+        action="store_true",
+        help=(
+            "Enable retrieval-agent style iterative expansion over baseline summaries. "
+            "Each turn can rewrite the query and retrieve new pages from the full summary corpus."
+        ),
+    )
+    p.add_argument(
+        "--iterative-max-turns",
+        type=int,
+        default=3,
+        help="Maximum iterative retrieval turns.",
+    )
+    p.add_argument(
+        "--iterative-topk-per-turn",
+        type=int,
+        default=200,
+        help="Number of summary-index candidates retrieved per turn and per query variant.",
+    )
+    p.add_argument(
+        "--iterative-max-pool",
+        type=int,
+        default=3000,
+        help="Maximum candidate pool size after iterative expansion.",
+    )
+    p.add_argument(
+        "--iterative-min-new-pages",
+        type=int,
+        default=10,
+        help="Early-stop if a turn adds fewer new pages and query rewrite made no progress.",
+    )
+    p.add_argument(
+        "--iterative-weight",
+        type=float,
+        default=0.8,
+        help="Weight for iterative retrieval lexical score (z-normalized).",
     )
     p.add_argument("--summary-ks", type=str, default="1,2,4,10,20,50,100,500")
     return p.parse_args()
@@ -539,6 +577,33 @@ def _load_context_map(path: Path) -> dict[str, str]:
     return out
 
 
+def _split_doc_page_uid(value: str) -> tuple[str, int] | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    patterns = [
+        r"^(.+)_page(-?\d+)$",
+        r"^(.+)#p(-?\d+)$",
+        r"^(.+):(-?\d+)$",
+        r"^(.+)/(-?\d+)$",
+    ]
+    for pat in patterns:
+        m = re.match(pat, s, flags=re.IGNORECASE)
+        if not m:
+            continue
+        doc_id = m.group(1).strip()
+        if not doc_id:
+            continue
+        try:
+            page_idx = int(m.group(2))
+        except Exception:
+            continue
+        return (doc_id, page_idx)
+    return None
+
+
 def _extract_first_json_object(text: str) -> Optional[dict]:
     if not text:
         return None
@@ -673,6 +738,145 @@ def _summary_match_score(query: str, summary_text: Optional[str]) -> float:
             bigram_hits += 1
     exact_hit = 1.0 if _norm_text(query).casefold() in _norm_text(summary_text).casefold() else 0.0
     return (coverage * 4.0) + (overlap_count * 0.35) + (bigram_hits * 1.5) + (exact_hit * 6.0)
+
+
+_LEXICAL_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "has",
+    "have",
+    "in",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "this",
+    "to",
+    "was",
+    "were",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "with",
+}
+
+
+def _tokenize_for_lexical(text: str) -> list[str]:
+    tokens = re.findall(r"[A-Za-z0-9']+", str(text).casefold())
+    out: list[str] = []
+    for tok in tokens:
+        if tok in _LEXICAL_STOPWORDS:
+            continue
+        if len(tok) <= 1:
+            continue
+        out.append(tok)
+    return out
+
+
+class _SummaryBm25Index:
+    def __init__(self, entries: list[tuple[str, int, str]], *, k1: float = 1.5, b: float = 0.75) -> None:
+        self.page_refs: list[tuple[str, int]] = []
+        self.doc_lens: list[int] = []
+        self.postings: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        self.idf: dict[str, float] = {}
+        self.k1 = float(k1)
+        self.b = float(b)
+        df: Counter[str] = Counter()
+
+        for doc_id, page_idx, text in entries:
+            tokens = _tokenize_for_lexical(text)
+            if not tokens:
+                continue
+            local_tf: Counter[str] = Counter(tokens)
+            doc_idx = len(self.page_refs)
+            self.page_refs.append((str(doc_id), int(page_idx)))
+            self.doc_lens.append(len(tokens))
+            for term, tf in local_tf.items():
+                self.postings[term].append((doc_idx, int(tf)))
+            df.update(local_tf.keys())
+
+        n_docs = len(self.page_refs)
+        self.avg_doc_len = (sum(self.doc_lens) / n_docs) if n_docs else 0.0
+        if n_docs > 0:
+            for term, doc_freq in df.items():
+                # BM25 idf with +1 smoothing for numerical stability.
+                self.idf[term] = math.log(1.0 + ((n_docs - doc_freq + 0.5) / (doc_freq + 0.5)))
+
+    def search(
+        self,
+        query: str,
+        *,
+        topk: int,
+        exclude_keys: Optional[set[tuple[str, int]]] = None,
+    ) -> list[tuple[str, int, float]]:
+        if topk <= 0 or not self.page_refs:
+            return []
+        tokens = _tokenize_for_lexical(query)
+        if not tokens:
+            return []
+        scores: dict[int, float] = defaultdict(float)
+        for term in set(tokens):
+            idf = self.idf.get(term)
+            if idf is None:
+                continue
+            for doc_idx, tf in self.postings.get(term, []):
+                doc_len = float(self.doc_lens[doc_idx])
+                denom = tf + (self.k1 * (1.0 - self.b + self.b * (doc_len / max(self.avg_doc_len, 1e-9))))
+                if denom <= 0:
+                    continue
+                scores[doc_idx] += idf * ((tf * (self.k1 + 1.0)) / denom)
+        if not scores:
+            return []
+
+        ranked = sorted(scores.items(), key=lambda z: z[1], reverse=True)
+        out: list[tuple[str, int, float]] = []
+        seen: set[tuple[str, int]] = set()
+        for doc_idx, score in ranked:
+            doc_id, page_idx = self.page_refs[doc_idx]
+            key = (doc_id, int(page_idx))
+            if exclude_keys is not None and key in exclude_keys:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((doc_id, int(page_idx), float(score)))
+            if len(out) >= topk:
+                break
+        return out
+
+
+def _build_summary_bm25_index(context_map: dict[str, str]) -> _SummaryBm25Index | None:
+    entries: dict[tuple[str, int], str] = {}
+    for raw_key, text in context_map.items():
+        if not text:
+            continue
+        parsed = _split_doc_page_uid(raw_key)
+        if parsed is None:
+            continue
+        doc_id, page_idx = parsed
+        key = (doc_id, int(page_idx))
+        existing = entries.get(key)
+        if existing is None or len(text) > len(existing):
+            entries[key] = text
+    if not entries:
+        return None
+    rows = [(doc_id, page_idx, text) for (doc_id, page_idx), text in entries.items()]
+    return _SummaryBm25Index(rows)
 
 
 _VISUAL_QUERY_PATTERNS: dict[str, list[str]] = {
@@ -1122,6 +1326,183 @@ def _rewrite_query_with_llm(
     return _norm_text(original_query), trace
 
 
+def _iterative_expand_candidates(
+    *,
+    initial_candidates: list[dict[str, Any]],
+    root_query: str,
+    context_map: dict[str, str],
+    summary_index: _SummaryBm25Index | None,
+    max_turns: int,
+    topk_per_turn: int,
+    max_pool: int,
+    min_new_pages: int,
+    rewrite_query: bool,
+    rewrite_base_url: Optional[str],
+    rewrite_model: Optional[str],
+    rewrite_api_key: str,
+    rewrite_context_candidates: int,
+    rewrite_summary_max_chars: int,
+    rewrite_max_retries: int,
+    rewrite_timeout_s: float,
+    rewrite_max_tokens: int,
+    rewrite_temperature: float,
+) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
+    trace: dict[str, Any] = {
+        "enabled": True,
+        "index_ready": bool(summary_index is not None),
+        "turns": [],
+    }
+    if not initial_candidates:
+        return [], _norm_text(root_query), trace
+
+    pool: dict[tuple[str, int], dict[str, Any]] = {}
+    base_scores = [float(c.get("score", 0.0)) for c in initial_candidates]
+    base_floor = min(base_scores) if base_scores else 0.0
+
+    for c in initial_candidates:
+        doc_id = str(c["doc_id"])
+        page_idx = int(c["page_idx"])
+        key = (doc_id, page_idx)
+        score = float(c.get("score", 0.0))
+        rec = pool.get(key)
+        if rec is None or score > float(rec.get("score", 0.0)):
+            pool[key] = {
+                "doc_id": doc_id,
+                "page_idx": page_idx,
+                "score": score,
+                "iterative_lexical_score": float(rec.get("iterative_lexical_score", 0.0) if rec else 0.0),
+                "candidate_source": "initial",
+                "retrieval_turn": 0,
+            }
+
+    current_query = _norm_text(root_query)
+    for turn in range(1, max(1, int(max_turns)) + 1):
+        retrieval_queries = [current_query]
+        if _norm_text(current_query) != _norm_text(root_query):
+            retrieval_queries.append(_norm_text(root_query))
+
+        seen_q: set[str] = set()
+        deduped_queries: list[str] = []
+        for q in retrieval_queries:
+            nq = _norm_text(q)
+            if not nq or nq in seen_q:
+                continue
+            seen_q.add(nq)
+            deduped_queries.append(nq)
+        retrieval_queries = deduped_queries
+
+        turn_hits: list[tuple[str, int, float, str]] = []
+        if summary_index is not None:
+            for retrieval_query in retrieval_queries:
+                hits = summary_index.search(
+                    retrieval_query,
+                    topk=max(1, int(topk_per_turn)),
+                    exclude_keys=None,
+                )
+                for doc_id, page_idx, score in hits:
+                    turn_hits.append((doc_id, page_idx, float(score), retrieval_query))
+
+        new_pages = 0
+        for doc_id, page_idx, score, source_query in turn_hits:
+            key = (doc_id, int(page_idx))
+            if key not in pool:
+                pool[key] = {
+                    "doc_id": doc_id,
+                    "page_idx": int(page_idx),
+                    "score": float(base_floor),
+                    "iterative_lexical_score": float(score),
+                    "candidate_source": "iterative",
+                    "retrieval_turn": int(turn),
+                    "retrieval_query": source_query,
+                }
+                new_pages += 1
+                continue
+            pool[key]["iterative_lexical_score"] = max(
+                float(pool[key].get("iterative_lexical_score", 0.0)),
+                float(score),
+            )
+
+        if len(pool) > max(1, int(max_pool)):
+            ranked_pool = sorted(
+                pool.values(),
+                key=lambda r: (
+                    1 if str(r.get("candidate_source")) == "initial" else 0,
+                    float(r.get("score", 0.0)),
+                    float(r.get("iterative_lexical_score", 0.0)),
+                ),
+                reverse=True,
+            )
+            keep = ranked_pool[: max(1, int(max_pool))]
+            pool = {(str(r["doc_id"]), int(r["page_idx"])): r for r in keep}
+
+        rewrite_trace_turn: dict[str, Any] = {
+            "enabled": bool(rewrite_query),
+            "attempted": False,
+            "success": False,
+            "error": None,
+            "raw_reply_preview": None,
+        }
+        query_changed = False
+        if rewrite_query and rewrite_base_url and rewrite_model and pool:
+            ranked_for_rewrite = sorted(
+                pool.values(),
+                key=lambda r: (
+                    float(r.get("iterative_lexical_score", 0.0)),
+                    float(r.get("score", 0.0)),
+                ),
+                reverse=True,
+            )[: max(1, int(rewrite_context_candidates))]
+            rewrite_rows = [
+                {
+                    "doc_id": str(r["doc_id"]),
+                    "page_idx": int(r["page_idx"]),
+                    "base_score": float(r.get("score", 0.0)),
+                    "summary_text": _lookup_context(context_map, str(r["doc_id"]), int(r["page_idx"])) or "",
+                }
+                for r in ranked_for_rewrite
+            ]
+            rewritten_query, rewrite_trace_turn = _rewrite_query_with_llm(
+                original_query=current_query,
+                rows=rewrite_rows,
+                base_url=str(rewrite_base_url),
+                model=str(rewrite_model),
+                api_key=rewrite_api_key,
+                summary_max_chars=int(rewrite_summary_max_chars),
+                max_retries=int(rewrite_max_retries),
+                timeout_s=float(rewrite_timeout_s),
+                max_tokens=int(rewrite_max_tokens),
+                temperature=float(rewrite_temperature),
+            )
+            if _norm_text(rewritten_query) != _norm_text(current_query):
+                query_changed = True
+                current_query = _norm_text(rewritten_query)
+
+        trace["turns"].append(
+            {
+                "turn": int(turn),
+                "queries": retrieval_queries,
+                "retrieved_hits": len(turn_hits),
+                "new_pages_added": int(new_pages),
+                "pool_size": int(len(pool)),
+                "query_after_turn": _norm_text(current_query),
+                "query_changed": bool(query_changed),
+                "rewrite_trace": rewrite_trace_turn,
+            }
+        )
+        if new_pages < max(0, int(min_new_pages)) and not query_changed:
+            break
+
+    expanded = sorted(
+        pool.values(),
+        key=lambda r: (
+            float(r.get("score", 0.0)),
+            float(r.get("iterative_lexical_score", 0.0)),
+        ),
+        reverse=True,
+    )
+    return expanded, _norm_text(current_query), trace
+
+
 def _llm_rerank_rows(
     *,
     query: str,
@@ -1212,6 +1593,7 @@ def main() -> int:
     )
     base_context_map = _load_context_map(args.baseline_meta_jsonl)
     visual_map = _load_visual_lexicon_map(args.visual_meta_jsonl)
+    summary_index = _build_summary_bm25_index(base_context_map) if args.iterative_retrieval else None
 
     if args.qid is not None:
         if args.qid not in qid2pages:
@@ -1250,7 +1632,37 @@ def main() -> int:
             "error": None,
             "raw_reply_preview": None,
         }
-        if args.rewrite_query:
+        iterative_trace = {
+            "enabled": bool(args.iterative_retrieval),
+            "index_ready": bool(summary_index is not None),
+            "turns": [],
+        }
+        if args.iterative_retrieval:
+            rewrite_base_url = args.rewrite_base_url or args.llm_base_url
+            rewrite_model = args.rewrite_model or args.llm_model
+            cands, query, iterative_trace = _iterative_expand_candidates(
+                initial_candidates=cands,
+                root_query=_norm_text(original_query),
+                context_map=base_context_map,
+                summary_index=summary_index,
+                max_turns=int(args.iterative_max_turns),
+                topk_per_turn=int(args.iterative_topk_per_turn),
+                max_pool=int(args.iterative_max_pool),
+                min_new_pages=int(args.iterative_min_new_pages),
+                rewrite_query=bool(args.rewrite_query),
+                rewrite_base_url=rewrite_base_url,
+                rewrite_model=rewrite_model,
+                rewrite_api_key=rewrite_api_key,
+                rewrite_context_candidates=int(args.rewrite_context_candidates),
+                rewrite_summary_max_chars=int(args.rewrite_summary_max_chars),
+                rewrite_max_retries=int(args.rewrite_max_retries),
+                rewrite_timeout_s=float(args.rewrite_timeout_s),
+                rewrite_max_tokens=int(args.rewrite_max_tokens),
+                rewrite_temperature=float(args.rewrite_temperature),
+            )
+            if args.rewrite_query and iterative_trace.get("turns"):
+                rewrite_trace = iterative_trace["turns"][-1].get("rewrite_trace", rewrite_trace)
+        elif args.rewrite_query:
             rewrite_rows = []
             for row in cands[: max(1, int(args.rewrite_context_candidates))]:
                 d = str(row["doc_id"])
@@ -1282,12 +1694,14 @@ def main() -> int:
         base_vals: list[float] = []
         summ_vals: list[float] = []
         vis_vals: list[float] = []
+        iter_vals: list[float] = []
         for row in cands:
             d = str(row["doc_id"])
             p = int(row["page_idx"])
             base_score = float(row["score"])
             summary_text = _lookup_context(base_context_map, d, p)
             visual_terms = _lookup_visual(visual_map, d, p)
+            iterative_score = float(row.get("iterative_lexical_score", 0.0))
             summary_score = _summary_match_score(query, summary_text)
             visual_score = _visual_match_score(
                 query=query,
@@ -1301,6 +1715,7 @@ def main() -> int:
                 "base_score": base_score,
                 "summary_score": float(summary_score),
                 "visual_score": float(visual_score),
+                "iterative_score": float(iterative_score),
                 "summary_text": summary_text or "",
                 "visual_terms": visual_terms or {},
             }
@@ -1308,18 +1723,23 @@ def main() -> int:
             base_vals.append(base_score)
             summ_vals.append(float(summary_score))
             vis_vals.append(float(visual_score))
+            iter_vals.append(float(iterative_score))
 
         bz = _zscore(base_vals)
         sz = _zscore(summ_vals)
         vz = _zscore(vis_vals)
+        iz = _zscore(iter_vals)
         for i, rec in enumerate(scored):
             rec["base_z"] = float(bz[i])
             rec["summary_z"] = float(sz[i])
             rec["visual_z"] = float(vz[i])
+            rec["iterative_z"] = float(iz[i])
             base_component = float(args.base_weight) * rec["base_z"]
+            iterative_component = float(args.iterative_weight) * rec["iterative_z"]
             meta_component = (
                 (float(args.summary_weight) * rec["summary_z"])
                 + (float(args.visual_weight) * rec["visual_z"])
+                + iterative_component
             )
             if args.boost_only:
                 meta_component = max(meta_component, 0.0)
@@ -1328,6 +1748,7 @@ def main() -> int:
                 final_score = max(final_score, base_component)
             rec["base_component"] = float(base_component)
             rec["meta_component"] = float(meta_component)
+            rec["iterative_component"] = float(iterative_component)
             rec["final_score"] = float(final_score)
 
         start_rank, end_rank = _window_bounds(
@@ -1387,11 +1808,14 @@ def main() -> int:
                 "base_score": float(r["base_score"]),
                 "summary_score": float(r["summary_score"]),
                 "visual_score": float(r["visual_score"]),
+                "iterative_score": float(r["iterative_score"]),
                 "base_z": float(r["base_z"]),
                 "summary_z": float(r["summary_z"]),
                 "visual_z": float(r["visual_z"]),
+                "iterative_z": float(r["iterative_z"]),
                 "base_component": float(r["base_component"]),
                 "meta_component": float(r["meta_component"]),
+                "iterative_component": float(r["iterative_component"]),
             }
             for r in save_rows
         ]
@@ -1425,10 +1849,12 @@ def main() -> int:
                 "base_weight": float(args.base_weight),
                 "summary_weight": float(args.summary_weight),
                 "visual_weight": float(args.visual_weight),
+                "iterative_weight": float(args.iterative_weight),
             },
             "original_query": _norm_text(original_query),
             "effective_query": _norm_text(query),
             "query_rewrite_trace": rewrite_trace,
+            "iterative_trace": iterative_trace,
             "freeze_top_n": int(args.freeze_top_n),
             "window_start_rank": int(args.window_start_rank),
             "window_end_rank": int(args.window_end_rank),
@@ -1438,10 +1864,14 @@ def main() -> int:
             "visual_min_confidence": float(args.visual_min_confidence),
         }
 
+    method_name = "metadata_rerank_baseline_plus_visual_lexicon"
+    if args.iterative_retrieval:
+        method_name = method_name + "_iterative_retrieval_agent"
+
     out: dict[str, Any] = {
         "meta": {
             "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "method": "metadata_rerank_baseline_plus_visual_lexicon",
+            "method": method_name,
             "source_retrieval_parquet": str(args.retrieval_parquet),
             "source_baseline_meta_jsonl": str(args.baseline_meta_jsonl),
             "source_visual_meta_jsonl": str(args.visual_meta_jsonl),
@@ -1453,8 +1883,14 @@ def main() -> int:
             "base_weight": float(args.base_weight),
             "summary_weight": float(args.summary_weight),
             "visual_weight": float(args.visual_weight),
+            "iterative_weight": float(args.iterative_weight),
             "visual_min_confidence": float(args.visual_min_confidence),
             "visual_uncertain_multiplier": float(args.visual_uncertain_multiplier),
+            "iterative_retrieval": bool(args.iterative_retrieval),
+            "iterative_max_turns": int(args.iterative_max_turns),
+            "iterative_topk_per_turn": int(args.iterative_topk_per_turn),
+            "iterative_max_pool": int(args.iterative_max_pool),
+            "iterative_min_new_pages": int(args.iterative_min_new_pages),
             "freeze_top_n": int(args.freeze_top_n),
             "window_start_rank": int(args.window_start_rank),
             "window_end_rank": int(args.window_end_rank),
