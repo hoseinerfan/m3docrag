@@ -197,6 +197,30 @@ def _parse_args() -> argparse.Namespace:
         help="Sampling temperature for query rewrite call.",
     )
     p.add_argument(
+        "--rewrite-min-token-overlap",
+        type=float,
+        default=0.45,
+        help="Minimum token-overlap ratio (vs original query) required to accept a rewritten query.",
+    )
+    p.add_argument(
+        "--rewrite-max-new-token-ratio",
+        type=float,
+        default=0.45,
+        help="Maximum ratio of newly introduced tokens allowed in rewritten query.",
+    )
+    p.add_argument(
+        "--rewrite-max-length-multiplier",
+        type=float,
+        default=1.7,
+        help="Maximum rewritten/original token length ratio allowed.",
+    )
+    p.add_argument(
+        "--rewrite-min-numeric-preservation",
+        type=float,
+        default=0.5,
+        help="Minimum fraction of numeric tokens from original query that must be preserved.",
+    )
+    p.add_argument(
         "--iterative-retrieval",
         action="store_true",
         help=(
@@ -1274,6 +1298,71 @@ def _extract_rewritten_query(raw_reply: str, original_query: str) -> str:
     return _norm_text(original_query)
 
 
+def _rewrite_guard_metrics(original_query: str, rewritten_query: str) -> dict[str, float]:
+    original = _norm_text(original_query)
+    rewritten = _norm_text(rewritten_query)
+    orig_tokens = _tokenize_for_lexical(original)
+    rew_tokens = _tokenize_for_lexical(rewritten)
+    orig_set = set(orig_tokens)
+    rew_set = set(rew_tokens)
+    overlap = len(orig_set & rew_set) / max(len(orig_set), 1)
+    new_ratio = len(rew_set - orig_set) / max(len(rew_set), 1)
+    length_multiplier = len(rew_tokens) / max(len(orig_tokens), 1)
+    orig_nums = set(re.findall(r"\d+(?:\.\d+)?", original))
+    rew_nums = set(re.findall(r"\d+(?:\.\d+)?", rewritten))
+    if orig_nums:
+        numeric_preservation = len(orig_nums & rew_nums) / max(len(orig_nums), 1)
+    else:
+        numeric_preservation = 1.0
+    return {
+        "overlap_ratio": float(overlap),
+        "new_token_ratio": float(new_ratio),
+        "length_multiplier": float(length_multiplier),
+        "numeric_preservation": float(numeric_preservation),
+        "orig_token_count": float(len(orig_tokens)),
+        "rew_token_count": float(len(rew_tokens)),
+    }
+
+
+def _is_rewrite_acceptable(
+    *,
+    original_query: str,
+    rewritten_query: str,
+    min_token_overlap: float,
+    max_new_token_ratio: float,
+    max_length_multiplier: float,
+    min_numeric_preservation: float,
+) -> tuple[bool, str, dict[str, float]]:
+    rewritten = _norm_text(rewritten_query)
+    original = _norm_text(original_query)
+    if not rewritten:
+        return False, "empty_rewrite", {}
+    if rewritten.casefold() == original.casefold():
+        return False, "unchanged", {}
+
+    metrics = _rewrite_guard_metrics(original, rewritten)
+    overlap_ratio = float(metrics.get("overlap_ratio", 0.0))
+    new_token_ratio = float(metrics.get("new_token_ratio", 1.0))
+    length_multiplier = float(metrics.get("length_multiplier", 999.0))
+    numeric_preservation = float(metrics.get("numeric_preservation", 0.0))
+    orig_token_count = int(metrics.get("orig_token_count", 0.0))
+
+    # Relax overlap threshold a bit for very short queries.
+    overlap_threshold = float(min_token_overlap)
+    if orig_token_count <= 3:
+        overlap_threshold = min(overlap_threshold, 0.25)
+
+    if overlap_ratio < overlap_threshold:
+        return False, "low_overlap", metrics
+    if new_token_ratio > float(max_new_token_ratio):
+        return False, "too_many_new_tokens", metrics
+    if length_multiplier > float(max_length_multiplier):
+        return False, "too_long", metrics
+    if numeric_preservation < float(min_numeric_preservation):
+        return False, "lost_numeric_constraints", metrics
+    return True, "accepted", metrics
+
+
 def _rewrite_query_with_llm(
     *,
     original_query: str,
@@ -1286,6 +1375,10 @@ def _rewrite_query_with_llm(
     timeout_s: float,
     max_tokens: int,
     temperature: float,
+    min_token_overlap: float,
+    max_new_token_ratio: float,
+    max_length_multiplier: float,
+    min_numeric_preservation: float,
 ) -> tuple[str, dict[str, Any]]:
     trace = {
         "enabled": True,
@@ -1293,6 +1386,8 @@ def _rewrite_query_with_llm(
         "success": False,
         "error": None,
         "raw_reply_preview": None,
+        "candidate_rewrite": None,
+        "guard_metrics": {},
     }
     if not rows:
         return _norm_text(original_query), trace
@@ -1316,9 +1411,21 @@ def _rewrite_query_with_llm(
             )
             trace["raw_reply_preview"] = _norm_text(raw)[:400]
             rewritten = _extract_rewritten_query(raw, original_query)
-            if rewritten and rewritten.casefold() != _norm_text(original_query).casefold():
+            trace["candidate_rewrite"] = _norm_text(rewritten)[:400]
+            ok, reason, guard_metrics = _is_rewrite_acceptable(
+                original_query=original_query,
+                rewritten_query=rewritten,
+                min_token_overlap=float(min_token_overlap),
+                max_new_token_ratio=float(max_new_token_ratio),
+                max_length_multiplier=float(max_length_multiplier),
+                min_numeric_preservation=float(min_numeric_preservation),
+            )
+            trace["guard_metrics"] = guard_metrics
+            if ok:
                 trace["success"] = True
-            return rewritten, trace
+                trace["error"] = None
+                return _norm_text(rewritten), trace
+            trace["error"] = f"rewrite_rejected:{reason}"
         except (urlerror.URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
             trace["error"] = str(exc)
         if attempt < attempts:
@@ -1346,6 +1453,10 @@ def _iterative_expand_candidates(
     rewrite_timeout_s: float,
     rewrite_max_tokens: int,
     rewrite_temperature: float,
+    rewrite_min_token_overlap: float,
+    rewrite_max_new_token_ratio: float,
+    rewrite_max_length_multiplier: float,
+    rewrite_min_numeric_preservation: float,
 ) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
     trace: dict[str, Any] = {
         "enabled": True,
@@ -1472,6 +1583,10 @@ def _iterative_expand_candidates(
                 timeout_s=float(rewrite_timeout_s),
                 max_tokens=int(rewrite_max_tokens),
                 temperature=float(rewrite_temperature),
+                min_token_overlap=float(rewrite_min_token_overlap),
+                max_new_token_ratio=float(rewrite_max_new_token_ratio),
+                max_length_multiplier=float(rewrite_max_length_multiplier),
+                min_numeric_preservation=float(rewrite_min_numeric_preservation),
             )
             if _norm_text(rewritten_query) != _norm_text(current_query):
                 query_changed = True
@@ -1557,6 +1672,16 @@ def _llm_rerank_rows(
 def main() -> int:
     args = _parse_args()
     summary_ks = _parse_summary_ks(args.summary_ks)
+    for name in (
+        "rewrite_min_token_overlap",
+        "rewrite_max_new_token_ratio",
+        "rewrite_min_numeric_preservation",
+    ):
+        v = float(getattr(args, name))
+        if v < 0.0 or v > 1.0:
+            raise ValueError(f"--{name.replace('_', '-')} must be within [0, 1]")
+    if float(args.rewrite_max_length_multiplier) <= 0.0:
+        raise ValueError("--rewrite-max-length-multiplier must be > 0")
     llm_api_key = _read_api_key(args.llm_api_key_file)
     rewrite_api_key = _read_api_key(args.rewrite_api_key_file) if args.rewrite_api_key_file else llm_api_key
     if args.llm_rerank:
@@ -1659,6 +1784,10 @@ def main() -> int:
                 rewrite_timeout_s=float(args.rewrite_timeout_s),
                 rewrite_max_tokens=int(args.rewrite_max_tokens),
                 rewrite_temperature=float(args.rewrite_temperature),
+                rewrite_min_token_overlap=float(args.rewrite_min_token_overlap),
+                rewrite_max_new_token_ratio=float(args.rewrite_max_new_token_ratio),
+                rewrite_max_length_multiplier=float(args.rewrite_max_length_multiplier),
+                rewrite_min_numeric_preservation=float(args.rewrite_min_numeric_preservation),
             )
             if args.rewrite_query and iterative_trace.get("turns"):
                 rewrite_trace = iterative_trace["turns"][-1].get("rewrite_trace", rewrite_trace)
@@ -1688,6 +1817,10 @@ def main() -> int:
                 timeout_s=float(args.rewrite_timeout_s),
                 max_tokens=int(args.rewrite_max_tokens),
                 temperature=float(args.rewrite_temperature),
+                min_token_overlap=float(args.rewrite_min_token_overlap),
+                max_new_token_ratio=float(args.rewrite_max_new_token_ratio),
+                max_length_multiplier=float(args.rewrite_max_length_multiplier),
+                min_numeric_preservation=float(args.rewrite_min_numeric_preservation),
             )
 
         scored: list[dict[str, Any]] = []
@@ -1854,6 +1987,12 @@ def main() -> int:
             "original_query": _norm_text(original_query),
             "effective_query": _norm_text(query),
             "query_rewrite_trace": rewrite_trace,
+            "rewrite_guard": {
+                "min_token_overlap": float(args.rewrite_min_token_overlap),
+                "max_new_token_ratio": float(args.rewrite_max_new_token_ratio),
+                "max_length_multiplier": float(args.rewrite_max_length_multiplier),
+                "min_numeric_preservation": float(args.rewrite_min_numeric_preservation),
+            },
             "iterative_trace": iterative_trace,
             "freeze_top_n": int(args.freeze_top_n),
             "window_start_rank": int(args.window_start_rank),
@@ -1916,6 +2055,10 @@ def main() -> int:
             "rewrite_timeout_s": float(args.rewrite_timeout_s),
             "rewrite_max_tokens": int(args.rewrite_max_tokens),
             "rewrite_temperature": float(args.rewrite_temperature),
+            "rewrite_min_token_overlap": float(args.rewrite_min_token_overlap),
+            "rewrite_max_new_token_ratio": float(args.rewrite_max_new_token_ratio),
+            "rewrite_max_length_multiplier": float(args.rewrite_max_length_multiplier),
+            "rewrite_min_numeric_preservation": float(args.rewrite_min_numeric_preservation),
             "qids_file": None if args.qids_file is None else str(args.qids_file),
             "max_qids": args.max_qids,
             "summary_ks": summary_ks,
