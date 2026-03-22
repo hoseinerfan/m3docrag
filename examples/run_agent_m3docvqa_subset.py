@@ -13,6 +13,8 @@ import re
 import time
 from pathlib import Path
 from typing import Callable, Optional
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 import torch
 from loguru import logger
@@ -135,9 +137,44 @@ def parse_args():
         help="Expansion factor used when hop-mode exploration increases retrieval depth on later turns.",
     )
     p.add_argument("--device", default="cpu")
-    p.add_argument("--policy-backend", default="stub", choices=["stub", "local-hf"])
+    p.add_argument("--policy-backend", default="stub", choices=["stub", "local-hf", "openai-api"])
     p.add_argument("--policy-model", default=None)
     p.add_argument("--policy-device", default=None)
+    p.add_argument(
+        "--policy-base-url",
+        default=None,
+        help="OpenAI-compatible base URL for --policy-backend openai-api (for example http://127.0.0.1:8010/v1).",
+    )
+    p.add_argument(
+        "--policy-api-key-file",
+        type=Path,
+        default=None,
+        help="Optional API key file for --policy-backend openai-api.",
+    )
+    p.add_argument(
+        "--policy-timeout-s",
+        type=float,
+        default=60.0,
+        help="HTTP timeout in seconds for --policy-backend openai-api.",
+    )
+    p.add_argument(
+        "--policy-max-retries",
+        type=int,
+        default=2,
+        help="Retry attempts for --policy-backend openai-api.",
+    )
+    p.add_argument(
+        "--policy-max-tokens",
+        type=int,
+        default=512,
+        help="Max completion tokens for --policy-backend openai-api.",
+    )
+    p.add_argument(
+        "--policy-temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for --policy-backend openai-api.",
+    )
     p.add_argument("--output-jsonl", type=Path, required=True, help="Output JSONL with per-example traces.")
     p.add_argument("--summary-json", type=Path, default=None, help="Optional summary JSON path.")
     p.add_argument("--save-context-dir", type=Path, default=None, help="Optional directory to save per-doc context maps.")
@@ -248,6 +285,67 @@ def parse_args():
     )
     p.add_argument("--stop-on-error", action="store_true")
     return p.parse_args()
+
+
+def _read_api_key(path: Optional[Path]) -> str:
+    if path is None or not path.exists():
+        return ""
+    return path.read_text().strip()
+
+
+def _chat_completions_url(base_url: str) -> str:
+    url = str(base_url).strip()
+    if url.endswith("/chat/completions"):
+        return url
+    return url.rstrip("/") + "/chat/completions"
+
+
+def make_llm_call_openai_api(
+    *,
+    base_url: str,
+    model: str,
+    api_key_file: Optional[Path],
+    timeout_s: float,
+    max_retries: int,
+    max_tokens: int,
+    temperature: float,
+) -> Callable[[str], str]:
+    if not base_url:
+        raise ValueError("--policy-base-url is required when --policy-backend openai-api")
+    if not model:
+        raise ValueError("--policy-model is required when --policy-backend openai-api")
+
+    api_key = _read_api_key(api_key_file) or "dummy-key"
+    url = _chat_completions_url(base_url)
+    attempts = max(1, int(max_retries))
+
+    def _call(prompt: str) -> str:
+        last_err: Optional[Exception] = None
+        payload = {
+            "model": str(model),
+            "messages": [{"role": "user", "content": str(prompt)}],
+            "temperature": float(temperature),
+            "max_tokens": int(max_tokens),
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        }
+        body = json.dumps(payload).encode("utf-8")
+        for attempt in range(1, attempts + 1):
+            try:
+                req = urlrequest.Request(url=url, data=body, headers=headers, method="POST")
+                with urlrequest.urlopen(req, timeout=float(timeout_s)) as resp:
+                    raw = resp.read().decode("utf-8")
+                obj = json.loads(raw)
+                return str(((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+            except (urlerror.URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+                last_err = exc
+                if attempt < attempts:
+                    time.sleep(0.6 * attempt)
+        raise RuntimeError(f"openai-api policy call failed after {attempts} attempts: {last_err}")
+
+    return _call
 
 
 def _load_json_or_jsonl(path: Path):
@@ -1939,20 +2037,42 @@ def main():
     if args.selection_only:
         llm_call = None
         if args.selection_retriever_agent:
-            if args.policy_backend != "local-hf":
-                raise ValueError("--selection-retriever-agent requires --policy-backend local-hf")
-            if not args.policy_model:
-                raise ValueError("--policy-model is required when --selection-retriever-agent is enabled")
-            llm_call = make_llm_call_local_hf(args.policy_model, device=policy_device)
-            logger.info("Selection-only RetrieverAgent reranker active via local-hf policy model.")
+            if args.policy_backend == "local-hf":
+                if not args.policy_model:
+                    raise ValueError("--policy-model is required when --selection-retriever-agent is enabled")
+                llm_call = make_llm_call_local_hf(args.policy_model, device=policy_device)
+                logger.info("Selection-only RetrieverAgent reranker active via local-hf policy model.")
+            elif args.policy_backend == "openai-api":
+                llm_call = make_llm_call_openai_api(
+                    base_url=str(args.policy_base_url or ""),
+                    model=str(args.policy_model or ""),
+                    api_key_file=args.policy_api_key_file,
+                    timeout_s=float(args.policy_timeout_s),
+                    max_retries=int(args.policy_max_retries),
+                    max_tokens=int(args.policy_max_tokens),
+                    temperature=float(args.policy_temperature),
+                )
+                logger.info("Selection-only RetrieverAgent reranker active via openai-api policy backend.")
+            else:
+                raise ValueError("--selection-retriever-agent requires --policy-backend local-hf or openai-api")
         else:
             logger.info("Selection-only mode uses heuristic hop planning; skipping policy model initialization.")
     elif args.policy_backend == "stub":
         llm_call = make_llm_call_stub()
-    else:
+    elif args.policy_backend == "local-hf":
         if not args.policy_model:
             raise ValueError("--policy-model is required when --policy-backend local-hf")
         llm_call = make_llm_call_local_hf(args.policy_model, device=policy_device)
+    else:
+        llm_call = make_llm_call_openai_api(
+            base_url=str(args.policy_base_url or ""),
+            model=str(args.policy_model or ""),
+            api_key_file=args.policy_api_key_file,
+            timeout_s=float(args.policy_timeout_s),
+            max_retries=int(args.policy_max_retries),
+            max_tokens=int(args.policy_max_tokens),
+            temperature=float(args.policy_temperature),
+        )
 
     cache = DocCache(
         embeddings_dir=embeddings_dir,
