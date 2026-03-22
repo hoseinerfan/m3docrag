@@ -195,6 +195,30 @@ def parse_args():
         help="Max hop queries to keep from the planner in --selection-only mode.",
     )
     p.add_argument(
+        "--selection-profile",
+        default="default",
+        choices=["default", "simpledoc"],
+        help="Preset for selection-only planner/retriever hyperparameters.",
+    )
+    p.add_argument(
+        "--selection-planner-backend",
+        default="heuristic",
+        choices=["heuristic", "llm"],
+        help="Hop planner backend in --selection-only mode.",
+    )
+    p.add_argument(
+        "--selection-planner-prompt-file",
+        type=Path,
+        default=None,
+        help="Optional prompt template file for LLM planner. Supports {question}, {max_hops}, {root_query}.",
+    )
+    p.add_argument(
+        "--selection-retriever-prompt-file",
+        type=Path,
+        default=None,
+        help="Optional prompt template file for RetrieverAgent reranker. Supports {query}, {max_select_docs}, {candidates}.",
+    )
+    p.add_argument(
         "--selection-topk-docs-per-hop",
         type=int,
         default=2,
@@ -231,6 +255,28 @@ def parse_args():
         type=int,
         default=1000,
         help="Max metadata candidates kept per query when --selection-summary-full-scan is enabled.",
+    )
+    p.add_argument(
+        "--selection-retrieval-depth-multiplier",
+        type=int,
+        default=8,
+        help="Depth multiplier applied to per-hop doc quota when building retrieval candidates.",
+    )
+    p.add_argument(
+        "--selection-candidate-multi-page",
+        action="store_true",
+        help="Retrieve multiple pages per doc for candidate construction (default is one page per doc).",
+    )
+    p.add_argument(
+        "--selection-stop-no-new-docs",
+        action="store_true",
+        help="Stop selection-only loop early when a hop yields too few new selected docs.",
+    )
+    p.add_argument(
+        "--selection-stop-min-new-docs",
+        type=int,
+        default=1,
+        help="Minimum number of newly selected docs required to continue when --selection-stop-no-new-docs is enabled.",
     )
     p.add_argument(
         "--selection-retriever-agent",
@@ -358,6 +404,15 @@ def _load_json_or_jsonl(path: Path):
                 rows.append(json.loads(line))
         return rows
     return json.loads(path.read_text())
+
+
+def _read_text_file_optional(path: Optional[Path]) -> Optional[str]:
+    if path is None:
+        return None
+    if not path.exists():
+        raise FileNotFoundError(path)
+    text = path.read_text().strip()
+    return text or None
 
 
 def _load_qid_filter(path: Optional[Path]) -> Optional[set[str]]:
@@ -658,11 +713,113 @@ def _heuristic_selection_hop_queries(question: str, max_queries: int) -> list[st
     return queries[: max(max_queries, 0)]
 
 
+def _render_prompt_template(template: Optional[str], values: dict[str, object]) -> Optional[str]:
+    if not template:
+        return None
+    rendered = str(template)
+    # Allow both {{key}} and {key} placeholders.
+    for k, v in values.items():
+        rendered = rendered.replace(f"{{{{{k}}}}}", str(v))
+    try:
+        rendered = rendered.format(**{k: str(v) for k, v in values.items()})
+    except Exception:
+        # Keep fallback rendered text if python formatting fails (for example JSON braces).
+        pass
+    return rendered
+
+
+def _selection_planner_prompt(
+    *,
+    question: str,
+    max_hops: int,
+    prompt_template: Optional[str],
+) -> str:
+    root_query = _norm_text(question)
+    rendered = _render_prompt_template(
+        prompt_template,
+        {
+            "question": question,
+            "root_query": root_query,
+            "max_hops": max(max_hops, 1),
+        },
+    )
+    if rendered:
+        return rendered
+    return (
+        "You are a retrieval planner for multi-hop document QA.\n"
+        "Produce focused hop queries for evidence retrieval.\n"
+        "Keep semantics aligned with the original question.\n\n"
+        f"QUESTION:\n{question}\n\n"
+        "Return JSON only:\n"
+        "{\n"
+        '  "hop_queries": ["<query1>", "<query2>"]\n'
+        "}\n"
+        f"Rules:\n- Include at most {max(max_hops, 1)} queries.\n"
+        "- First query should be the root or close paraphrase of the original question.\n"
+        "- Keep entities/numbers/years intact.\n"
+    )
+
+
+def _parse_selection_planner_response(
+    *,
+    raw_reply: str,
+    question: str,
+    max_hops: int,
+) -> list[str]:
+    root_query = _norm_text(question)
+    queries: list[str] = []
+    payload = _extract_first_json_object(raw_reply)
+    if isinstance(payload, dict):
+        for key in ("hop_queries", "queries", "subqueries", "retrieval_queries"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                for item in value:
+                    if isinstance(item, str) and item.strip():
+                        queries.append(_norm_text(item))
+                break
+    if not queries and raw_reply:
+        for line in str(raw_reply).splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            lower = line.lower()
+            if lower.startswith("hop_query:"):
+                queries.append(_norm_text(line.split(":", 1)[1]))
+
+    queries = [q for q in _dedupe_keep_order(queries) if q]
+    if not queries:
+        return [root_query]
+    if queries[0].casefold() != root_query.casefold():
+        queries = [root_query] + [q for q in queries if q.casefold() != root_query.casefold()]
+    return queries[: max(max_hops, 1)]
+
+
 def _plan_selection_hop_queries(
     *,
     question: str,
     max_hops: int,
+    planner_backend: str = "heuristic",
+    planner_llm_call: Optional[Callable[[str], str]] = None,
+    planner_prompt_template: Optional[str] = None,
 ) -> tuple[list[str], Optional[str]]:
+    if planner_backend == "llm" and planner_llm_call is not None:
+        prompt = _selection_planner_prompt(
+            question=question,
+            max_hops=max_hops,
+            prompt_template=planner_prompt_template,
+        )
+        try:
+            raw_reply = planner_llm_call(prompt) or ""
+            queries = _parse_selection_planner_response(
+                raw_reply=raw_reply,
+                question=question,
+                max_hops=max_hops,
+            )
+            planner_reply = raw_reply if raw_reply else "\n".join([f"HOP_QUERY: {q}" for q in queries])
+            return queries, planner_reply
+        except Exception as exc:
+            logger.warning("LLM planner failed, falling back to heuristic planner: {}", exc)
+
     root_query = _norm_text(question)
     comparison_queries = _extract_comparison_option_queries(question)
     if max_hops <= 1:
@@ -681,9 +838,9 @@ def _plan_selection_hop_queries(
     return queries, planner_reply
 
 
-def _selection_only_retrieval_depth(selection_topk_docs_per_hop: int) -> int:
+def _selection_only_retrieval_depth(selection_topk_docs_per_hop: int, depth_multiplier: int = 8) -> int:
     quota = max(selection_topk_docs_per_hop, 1)
-    return max(quota * 8, 8)
+    return max(quota * max(int(depth_multiplier), 1), 8)
 
 
 def _selection_retriever_prompt(
@@ -691,6 +848,7 @@ def _selection_retriever_prompt(
     question: str,
     candidates: list[dict],
     max_select_docs: int,
+    prompt_template: Optional[str] = None,
 ) -> str:
     lines = []
     for row in candidates:
@@ -700,6 +858,17 @@ def _selection_retriever_prompt(
             f"retrieval_score={row['score']:.4f} summary={summary}"
         )
     joined_candidates = "\n".join(lines)
+    rendered = _render_prompt_template(
+        prompt_template,
+        {
+            "query": question,
+            "question": question,
+            "max_select_docs": max(max_select_docs, 1),
+            "candidates": joined_candidates,
+        },
+    )
+    if rendered:
+        return rendered
     return (
         "You are a RetrieverAgent for multi-hop document QA.\n"
         "Task: choose candidate docs/pages most likely to contain evidence for the query.\n"
@@ -794,6 +963,7 @@ def _rerank_with_selection_retriever_agent(
     llm_call: Optional[Callable[[str], str]],
     candidate_doc_limit: int,
     max_select_docs: int,
+    prompt_template: Optional[str] = None,
 ) -> tuple[list[tuple[str, int, float]], dict]:
     trace = {
         "enabled": True,
@@ -838,6 +1008,7 @@ def _rerank_with_selection_retriever_agent(
         question=query,
         candidates=candidate_payload,
         max_select_docs=max_select_docs,
+        prompt_template=prompt_template,
     )
     try:
         raw_reply = llm_call(prompt)
@@ -1454,6 +1625,9 @@ def run_selection_only_session(
     question: str,
     rag_model,
     docid2embs: dict,
+    selection_planner_backend: str = "heuristic",
+    selection_planner_llm_call: Optional[Callable[[str], str]] = None,
+    selection_planner_prompt_template: Optional[str] = None,
     selection_max_hop_queries: int,
     selection_topk_docs_per_hop: int,
     selection_root_topk_docs: Optional[int] = None,
@@ -1461,10 +1635,15 @@ def run_selection_only_session(
     selection_max_variant_queries: Optional[int] = None,
     selection_summary_full_scan: bool = False,
     selection_summary_full_scan_topk: int = 1000,
+    selection_retrieval_depth_multiplier: int = 8,
+    selection_candidate_single_page_per_doc: bool = True,
+    selection_stop_no_new_docs: bool = False,
+    selection_stop_min_new_docs: int = 1,
     selection_retriever_agent: bool = False,
     selection_retriever_candidate_docs: int = 40,
     selection_retriever_select_docs: int = 12,
     selection_retriever_llm_call: Optional[Callable[[str], str]] = None,
+    selection_retriever_prompt_template: Optional[str] = None,
     page_summary_map: Optional[dict[str, str]] = None,
     page_visual_meta_map: Optional[dict[str, dict[str, float | bool]]] = None,
     selection_visual_boost: float = 2.0,
@@ -1473,6 +1652,9 @@ def run_selection_only_session(
     hop_queries, planner_reply = _plan_selection_hop_queries(
         question=question,
         max_hops=selection_max_hop_queries,
+        planner_backend=selection_planner_backend,
+        planner_llm_call=selection_planner_llm_call,
+        planner_prompt_template=selection_planner_prompt_template,
     )
     if hop_queries and selection_max_variant_queries is not None:
         root_query = hop_queries[0]
@@ -1502,7 +1684,11 @@ def run_selection_only_session(
         selection_root_topk_docs or 0,
         selection_variant_topk_docs or 0,
     )
-    base_retrieval_depth = _selection_only_retrieval_depth(max_selection_quota)
+    base_retrieval_depth = _selection_only_retrieval_depth(
+        max_selection_quota,
+        depth_multiplier=selection_retrieval_depth_multiplier,
+    )
+    final_reason = "selection_only"
 
     for turn, hop_query in enumerate(hop_queries, start=1):
         if turn == 1 and selection_root_topk_docs is not None:
@@ -1524,7 +1710,7 @@ def run_selection_only_session(
             token2pageuid=None,
             all_token_embeddings=None,
             n_return_pages=query_retrieval_depth,
-            single_page_from_each_doc=True,
+            single_page_from_each_doc=selection_candidate_single_page_per_doc,
             show_progress=False,
         )
         metadata_candidates = []
@@ -1553,6 +1739,7 @@ def run_selection_only_session(
                 llm_call=selection_retriever_llm_call,
                 candidate_doc_limit=selection_retriever_candidate_docs,
                 max_select_docs=selection_retriever_select_docs,
+                prompt_template=selection_retriever_prompt_template,
             )
 
         top_docs = _top_docs_payload_from_pages(
@@ -1565,6 +1752,7 @@ def run_selection_only_session(
             visual_boost=selection_visual_boost,
             min_visual_confidence=selection_visual_min_confidence,
         )
+        selected_doc_ids_before = set(selected_doc_ids)
         selected_pages = _select_selection_only_pages(
             query=hop_query,
             retrieved=retrieved_for_selection,
@@ -1576,6 +1764,8 @@ def run_selection_only_session(
             visual_boost=selection_visual_boost,
             min_visual_confidence=selection_visual_min_confidence,
         )
+        new_selected_docs = sorted(selected_doc_ids - selected_doc_ids_before)
+        new_selected_doc_count = len(new_selected_docs)
 
         steps.append(
             {
@@ -1586,6 +1776,8 @@ def run_selection_only_session(
                 "stop_reason": None,
                 "action_type": "selection_only",
                 "facts_added": [],
+                "new_selected_doc_count": new_selected_doc_count,
+                "new_selected_doc_ids": new_selected_docs,
                 "retrieval_traces": [
                     {
                         "query": hop_query,
@@ -1608,20 +1800,30 @@ def run_selection_only_session(
                 ],
             }
         )
+        if selection_stop_no_new_docs and new_selected_doc_count < max(1, int(selection_stop_min_new_docs)):
+            steps[-1]["stop_reason"] = "no-new-selected-docs"
+            final_reason = "no-new-selected-docs"
+            break
 
     return {
         "answer": None,
-        "reason": "selection_only",
+        "reason": final_reason,
         "steps": steps,
             "selection_plan": {
                 "planner_reply": planner_reply,
                 "hop_queries": hop_queries,
+                "planner_backend": selection_planner_backend,
+                "planner_prompt_template_used": bool(selection_planner_prompt_template),
                 "topk_docs_per_hop": selection_topk_docs_per_hop,
                 "root_topk_docs": selection_root_topk_docs,
                 "variant_topk_docs": selection_variant_topk_docs,
                 "max_variant_queries": selection_max_variant_queries,
                 "retrieval_depth_per_query": base_retrieval_depth,
                 "descriptor_retrieval_depth_per_query": max(base_retrieval_depth * 4, 64),
+                "retrieval_depth_multiplier": selection_retrieval_depth_multiplier,
+                "single_page_from_each_doc": selection_candidate_single_page_per_doc,
+                "stop_no_new_docs": selection_stop_no_new_docs,
+                "stop_min_new_docs": selection_stop_min_new_docs,
                 "page_summaries_enabled": bool(page_summary_map),
                 "page_visual_metadata_enabled": bool(page_visual_meta_map),
                 "summary_full_scan": selection_summary_full_scan,
@@ -1629,6 +1831,7 @@ def run_selection_only_session(
                 "selection_retriever_agent": selection_retriever_agent,
                 "selection_retriever_candidate_docs": selection_retriever_candidate_docs,
                 "selection_retriever_select_docs": selection_retriever_select_docs,
+                "selection_retriever_prompt_template_used": bool(selection_retriever_prompt_template),
                 "selection_visual_boost": selection_visual_boost,
                 "selection_visual_min_confidence": selection_visual_min_confidence,
             },
@@ -1971,6 +2174,18 @@ class DocCache:
 
 def main():
     args = parse_args()
+    if args.selection_profile == "simpledoc":
+        args.selection_only = True
+        args.selection_planner_backend = "llm"
+        args.selection_max_hop_queries = max(int(args.selection_max_hop_queries), 3)
+        args.selection_topk_docs_per_hop = max(int(args.selection_topk_docs_per_hop), 2)
+        args.selection_retriever_agent = True
+        args.selection_retriever_candidate_docs = max(int(args.selection_retriever_candidate_docs), 40)
+        args.selection_retriever_select_docs = max(int(args.selection_retriever_select_docs), 12)
+        args.selection_summary_full_scan = True
+        args.selection_retrieval_depth_multiplier = max(int(args.selection_retrieval_depth_multiplier), 8)
+        args.selection_stop_no_new_docs = True
+        args.selection_stop_min_new_docs = max(int(args.selection_stop_min_new_docs), 1)
     configure_warning_filters()
 
     mmqa_jsonl = args.mmqa_jsonl
@@ -2034,14 +2249,21 @@ def main():
 
     rag_model = build_rag_model(device=args.device)
     policy_device = args.policy_device or args.device
+    selection_planner_prompt_template = _read_text_file_optional(args.selection_planner_prompt_file)
+    selection_retriever_prompt_template = _read_text_file_optional(args.selection_retriever_prompt_file)
+
+    selection_needs_llm = bool(args.selection_retriever_agent) or (
+        args.selection_only and args.selection_planner_backend == "llm"
+    )
+
     if args.selection_only:
         llm_call = None
-        if args.selection_retriever_agent:
+        if selection_needs_llm:
             if args.policy_backend == "local-hf":
                 if not args.policy_model:
-                    raise ValueError("--policy-model is required when --selection-retriever-agent is enabled")
+                    raise ValueError("--policy-model is required when LLM planner/retriever is enabled in --selection-only mode")
                 llm_call = make_llm_call_local_hf(args.policy_model, device=policy_device)
-                logger.info("Selection-only RetrieverAgent reranker active via local-hf policy model.")
+                logger.info("Selection-only LLM planner/retriever active via local-hf policy model.")
             elif args.policy_backend == "openai-api":
                 llm_call = make_llm_call_openai_api(
                     base_url=str(args.policy_base_url or ""),
@@ -2052,17 +2274,23 @@ def main():
                     max_tokens=int(args.policy_max_tokens),
                     temperature=float(args.policy_temperature),
                 )
-                logger.info("Selection-only RetrieverAgent reranker active via openai-api policy backend.")
+                logger.info("Selection-only LLM planner/retriever active via openai-api policy backend.")
             else:
-                raise ValueError("--selection-retriever-agent requires --policy-backend local-hf or openai-api")
+                raise ValueError("LLM planner/retriever in --selection-only mode requires --policy-backend local-hf or openai-api")
         else:
-            logger.info("Selection-only mode uses heuristic hop planning; skipping policy model initialization.")
+            logger.info("Selection-only mode uses heuristic planner and no RetrieverAgent LLM reranking.")
+        selection_planner_llm_call = llm_call if args.selection_planner_backend == "llm" else None
+        selection_retriever_llm_call = llm_call if args.selection_retriever_agent else None
     elif args.policy_backend == "stub":
         llm_call = make_llm_call_stub()
+        selection_planner_llm_call = None
+        selection_retriever_llm_call = None
     elif args.policy_backend == "local-hf":
         if not args.policy_model:
             raise ValueError("--policy-model is required when --policy-backend local-hf")
         llm_call = make_llm_call_local_hf(args.policy_model, device=policy_device)
+        selection_planner_llm_call = None
+        selection_retriever_llm_call = None
     else:
         llm_call = make_llm_call_openai_api(
             base_url=str(args.policy_base_url or ""),
@@ -2073,6 +2301,8 @@ def main():
             max_tokens=int(args.policy_max_tokens),
             temperature=float(args.policy_temperature),
         )
+        selection_planner_llm_call = None
+        selection_retriever_llm_call = None
 
     cache = DocCache(
         embeddings_dir=embeddings_dir,
@@ -2189,6 +2419,9 @@ def main():
                         question=question,
                         rag_model=rag_model,
                         docid2embs=docid2embs,
+                        selection_planner_backend=args.selection_planner_backend,
+                        selection_planner_llm_call=selection_planner_llm_call,
+                        selection_planner_prompt_template=selection_planner_prompt_template,
                         selection_max_hop_queries=args.selection_max_hop_queries,
                         selection_topk_docs_per_hop=args.selection_topk_docs_per_hop,
                         selection_root_topk_docs=args.selection_root_topk_docs,
@@ -2196,10 +2429,15 @@ def main():
                         selection_max_variant_queries=args.selection_max_variant_queries,
                         selection_summary_full_scan=args.selection_summary_full_scan,
                         selection_summary_full_scan_topk=args.selection_summary_full_scan_topk,
+                        selection_retrieval_depth_multiplier=args.selection_retrieval_depth_multiplier,
+                        selection_candidate_single_page_per_doc=(not args.selection_candidate_multi_page),
+                        selection_stop_no_new_docs=args.selection_stop_no_new_docs,
+                        selection_stop_min_new_docs=args.selection_stop_min_new_docs,
                         selection_retriever_agent=args.selection_retriever_agent,
                         selection_retriever_candidate_docs=args.selection_retriever_candidate_docs,
                         selection_retriever_select_docs=args.selection_retriever_select_docs,
-                        selection_retriever_llm_call=llm_call,
+                        selection_retriever_llm_call=selection_retriever_llm_call,
+                        selection_retriever_prompt_template=selection_retriever_prompt_template,
                         page_summary_map=page_summary_map,
                         page_visual_meta_map=page_visual_meta_map,
                         selection_visual_boost=args.selection_visual_boost,
@@ -2286,7 +2524,11 @@ def main():
             "n_return_pages": args.n_return_pages,
             "explore_return_pages_multiplier": args.explore_return_pages_multiplier,
             "selection_only": args.selection_only,
-            "selection_planner": ("heuristic" if args.selection_only else None),
+            "selection_profile": args.selection_profile,
+            "selection_planner": (args.selection_planner_backend if args.selection_only else None),
+            "selection_planner_prompt_file": (
+                str(args.selection_planner_prompt_file) if args.selection_planner_prompt_file else None
+            ),
             "selection_max_hop_queries": args.selection_max_hop_queries,
             "selection_topk_docs_per_hop": args.selection_topk_docs_per_hop,
             "selection_root_topk_docs": args.selection_root_topk_docs,
@@ -2294,9 +2536,16 @@ def main():
             "selection_max_variant_queries": args.selection_max_variant_queries,
             "selection_summary_full_scan": args.selection_summary_full_scan,
             "selection_summary_full_scan_topk": args.selection_summary_full_scan_topk,
+            "selection_retrieval_depth_multiplier": args.selection_retrieval_depth_multiplier,
+            "selection_candidate_single_page_per_doc": (not args.selection_candidate_multi_page),
+            "selection_stop_no_new_docs": args.selection_stop_no_new_docs,
+            "selection_stop_min_new_docs": args.selection_stop_min_new_docs,
             "selection_retriever_agent": args.selection_retriever_agent,
             "selection_retriever_candidate_docs": args.selection_retriever_candidate_docs,
             "selection_retriever_select_docs": args.selection_retriever_select_docs,
+            "selection_retriever_prompt_file": (
+                str(args.selection_retriever_prompt_file) if args.selection_retriever_prompt_file else None
+            ),
             "page_summaries_file": (str(args.page_summaries_file) if args.page_summaries_file else None),
             "page_visual_metadata_file": (
                 str(args.page_visual_metadata_file) if args.page_visual_metadata_file else None
@@ -2305,6 +2554,12 @@ def main():
             "selection_visual_min_confidence": args.selection_visual_min_confidence,
             "policy_backend": args.policy_backend,
             "policy_model": args.policy_model,
+            "policy_base_url": args.policy_base_url,
+            "policy_api_key_file": (str(args.policy_api_key_file) if args.policy_api_key_file else None),
+            "policy_timeout_s": args.policy_timeout_s,
+            "policy_max_retries": args.policy_max_retries,
+            "policy_max_tokens": args.policy_max_tokens,
+            "policy_temperature": args.policy_temperature,
             "policy_device": policy_device,
             "device": args.device,
             "context_backend": args.context_backend,
