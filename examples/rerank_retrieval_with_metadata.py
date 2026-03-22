@@ -221,6 +221,92 @@ def _parse_args() -> argparse.Namespace:
         help="Minimum fraction of numeric tokens from original query that must be preserved.",
     )
     p.add_argument(
+        "--answer-conditioned-retrieval",
+        action="store_true",
+        help=(
+            "Enable answer-conditioned multi-hop retrieval. Each turn derives a provisional "
+            "answer/evidence focus and proposes a targeted follow-up retrieval query."
+        ),
+    )
+    p.add_argument(
+        "--answer-base-url",
+        type=str,
+        default=None,
+        help="OpenAI-compatible base URL for answer-conditioned hop generation. Defaults to --rewrite-base-url or --llm-base-url.",
+    )
+    p.add_argument(
+        "--answer-model",
+        type=str,
+        default=None,
+        help="Model for answer-conditioned follow-up query generation. Defaults to --rewrite-model or --llm-model.",
+    )
+    p.add_argument(
+        "--answer-api-key-file",
+        type=Path,
+        default=None,
+        help="Optional API key file for answer-conditioned generation. Defaults to --rewrite-api-key-file or --llm-api-key-file.",
+    )
+    p.add_argument(
+        "--answer-context-candidates",
+        type=int,
+        default=20,
+        help="Number of top candidates provided as evidence context to the answer-conditioned hop generator.",
+    )
+    p.add_argument(
+        "--answer-summary-max-chars",
+        type=int,
+        default=220,
+        help="Max summary chars per candidate sent to answer-conditioned hop generator.",
+    )
+    p.add_argument(
+        "--answer-max-retries",
+        type=int,
+        default=2,
+        help="Retry attempts for each answer-conditioned generation call.",
+    )
+    p.add_argument(
+        "--answer-timeout-s",
+        type=float,
+        default=60.0,
+        help="HTTP timeout in seconds for answer-conditioned generation call.",
+    )
+    p.add_argument(
+        "--answer-max-tokens",
+        type=int,
+        default=192,
+        help="Max completion tokens for answer-conditioned generation call.",
+    )
+    p.add_argument(
+        "--answer-temperature",
+        type=float,
+        default=0.0,
+        help="Sampling temperature for answer-conditioned generation call.",
+    )
+    p.add_argument(
+        "--answer-min-token-overlap",
+        type=float,
+        default=0.30,
+        help="Minimum token-overlap ratio (vs original query) required to accept answer-conditioned follow-up query.",
+    )
+    p.add_argument(
+        "--answer-max-new-token-ratio",
+        type=float,
+        default=0.70,
+        help="Maximum ratio of newly introduced tokens allowed in answer-conditioned follow-up query.",
+    )
+    p.add_argument(
+        "--answer-max-length-multiplier",
+        type=float,
+        default=2.0,
+        help="Maximum follow-up/original token length ratio allowed for answer-conditioned follow-up query.",
+    )
+    p.add_argument(
+        "--answer-min-numeric-preservation",
+        type=float,
+        default=1.0,
+        help="Minimum fraction of numeric tokens from original query that must be preserved in answer-conditioned follow-up query.",
+    )
+    p.add_argument(
         "--iterative-retrieval",
         action="store_true",
         help=(
@@ -1433,6 +1519,148 @@ def _rewrite_query_with_llm(
     return _norm_text(original_query), trace
 
 
+def _build_answer_conditioned_prompt(
+    *,
+    original_query: str,
+    current_query: str,
+    rows: list[dict[str, Any]],
+    summary_max_chars: int,
+) -> str:
+    lines = []
+    for i, row in enumerate(rows, start=1):
+        summary = _norm_text(str(row.get("summary_text", "")))[: max(1, int(summary_max_chars))]
+        lines.append(
+            f"[{i}] doc_id={row['doc_id']} page_idx={int(row['page_idx'])} "
+            f"base_score={float(row['base_score']):.6f} summary={summary}"
+        )
+    joined = "\n".join(lines)
+    return (
+        "You are a multi-hop retrieval planner for document QA.\n"
+        "From the current evidence snippets, produce a targeted next retrieval query.\n"
+        "Do NOT answer the question definitively. Focus on what evidence is still missing.\n\n"
+        f"ORIGINAL_QUERY:\n{_norm_text(original_query)}\n\n"
+        f"CURRENT_QUERY:\n{_norm_text(current_query)}\n\n"
+        "CURRENT_EVIDENCE_CANDIDATES:\n"
+        f"{joined}\n\n"
+        "Return JSON only:\n"
+        "{\n"
+        '  "provisional_answer": "<best current hypothesis from evidence>",\n'
+        '  "missing_evidence": "<what evidence is missing to confirm answer>",\n'
+        '  "follow_up_query": "<targeted retrieval query for next hop>"\n'
+        "}\n"
+        "Rules:\n"
+        "- Keep the same answer target as ORIGINAL_QUERY.\n"
+        "- Preserve explicit constraints (entities, years, numbers, comparisons).\n"
+        "- Do not introduce unrelated entities.\n"
+        "- follow_up_query must be one sentence.\n"
+    )
+
+
+def _extract_answer_conditioned_fields(raw_reply: str, fallback_query: str) -> tuple[str, str, str]:
+    provisional_answer = ""
+    missing_evidence = ""
+    follow_up_query = _norm_text(fallback_query)
+    if not raw_reply:
+        return provisional_answer, missing_evidence, follow_up_query
+    payload = _extract_first_json_object(raw_reply)
+    if isinstance(payload, dict):
+        pa = payload.get("provisional_answer")
+        me = payload.get("missing_evidence")
+        fq = payload.get("follow_up_query")
+        if isinstance(pa, str) and pa.strip():
+            provisional_answer = _norm_text(pa)
+        if isinstance(me, str) and me.strip():
+            missing_evidence = _norm_text(me)
+        if isinstance(fq, str) and fq.strip():
+            follow_up_query = _norm_text(fq)
+    return provisional_answer, missing_evidence, follow_up_query
+
+
+def _answer_conditioned_query_with_llm(
+    *,
+    original_query: str,
+    current_query: str,
+    rows: list[dict[str, Any]],
+    base_url: str,
+    model: str,
+    api_key: str,
+    summary_max_chars: int,
+    max_retries: int,
+    timeout_s: float,
+    max_tokens: int,
+    temperature: float,
+    min_token_overlap: float,
+    max_new_token_ratio: float,
+    max_length_multiplier: float,
+    min_numeric_preservation: float,
+) -> tuple[str, dict[str, Any]]:
+    trace = {
+        "enabled": True,
+        "attempted": False,
+        "success": False,
+        "error": None,
+        "raw_reply_preview": None,
+        "provisional_answer": None,
+        "missing_evidence": None,
+        "candidate_follow_up_query": None,
+        "guard_metrics": {},
+    }
+    if not rows:
+        return _norm_text(current_query), trace
+    prompt = _build_answer_conditioned_prompt(
+        original_query=original_query,
+        current_query=current_query,
+        rows=rows,
+        summary_max_chars=summary_max_chars,
+    )
+    attempts = max(1, int(max_retries))
+    for attempt in range(1, attempts + 1):
+        trace["attempted"] = True
+        try:
+            raw = _call_llm_rerank_once(
+                base_url=base_url,
+                model=model,
+                api_key=api_key,
+                prompt=prompt,
+                timeout_s=timeout_s,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            trace["raw_reply_preview"] = _norm_text(raw)[:400]
+            provisional_answer, missing_evidence, follow_up_query = _extract_answer_conditioned_fields(
+                raw_reply=raw,
+                fallback_query=current_query,
+            )
+            if provisional_answer:
+                trace["provisional_answer"] = provisional_answer[:500]
+            if missing_evidence:
+                trace["missing_evidence"] = missing_evidence[:500]
+            trace["candidate_follow_up_query"] = _norm_text(follow_up_query)[:400]
+
+            ok, reason, guard_metrics = _is_rewrite_acceptable(
+                original_query=original_query,
+                rewritten_query=follow_up_query,
+                min_token_overlap=float(min_token_overlap),
+                max_new_token_ratio=float(max_new_token_ratio),
+                max_length_multiplier=float(max_length_multiplier),
+                min_numeric_preservation=float(min_numeric_preservation),
+            )
+            trace["guard_metrics"] = guard_metrics
+            if ok and _norm_text(follow_up_query) != _norm_text(current_query):
+                trace["success"] = True
+                trace["error"] = None
+                return _norm_text(follow_up_query), trace
+            if not ok:
+                trace["error"] = f"answer_conditioned_rejected:{reason}"
+            else:
+                trace["error"] = "answer_conditioned_rejected:unchanged_vs_current"
+        except (urlerror.URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
+            trace["error"] = str(exc)
+        if attempt < attempts:
+            time.sleep(0.6 * attempt)
+    return _norm_text(current_query), trace
+
+
 def _iterative_expand_candidates(
     *,
     initial_candidates: list[dict[str, Any]],
@@ -1457,6 +1685,20 @@ def _iterative_expand_candidates(
     rewrite_max_new_token_ratio: float,
     rewrite_max_length_multiplier: float,
     rewrite_min_numeric_preservation: float,
+    answer_conditioned_retrieval: bool,
+    answer_base_url: Optional[str],
+    answer_model: Optional[str],
+    answer_api_key: str,
+    answer_context_candidates: int,
+    answer_summary_max_chars: int,
+    answer_max_retries: int,
+    answer_timeout_s: float,
+    answer_max_tokens: int,
+    answer_temperature: float,
+    answer_min_token_overlap: float,
+    answer_max_new_token_ratio: float,
+    answer_max_length_multiplier: float,
+    answer_min_numeric_preservation: float,
 ) -> tuple[list[dict[str, Any]], str, dict[str, Any]]:
     trace: dict[str, Any] = {
         "enabled": True,
@@ -1553,6 +1795,16 @@ def _iterative_expand_candidates(
             "error": None,
             "raw_reply_preview": None,
         }
+        answer_trace_turn: dict[str, Any] = {
+            "enabled": bool(answer_conditioned_retrieval),
+            "attempted": False,
+            "success": False,
+            "error": None,
+            "raw_reply_preview": None,
+            "provisional_answer": None,
+            "missing_evidence": None,
+            "candidate_follow_up_query": None,
+        }
         query_changed = False
         if rewrite_query and rewrite_base_url and rewrite_model and pool:
             ranked_for_rewrite = sorted(
@@ -1592,6 +1844,45 @@ def _iterative_expand_candidates(
                 query_changed = True
                 current_query = _norm_text(rewritten_query)
 
+        if answer_conditioned_retrieval and answer_base_url and answer_model and pool:
+            ranked_for_answer = sorted(
+                pool.values(),
+                key=lambda r: (
+                    float(r.get("iterative_lexical_score", 0.0)),
+                    float(r.get("score", 0.0)),
+                ),
+                reverse=True,
+            )[: max(1, int(answer_context_candidates))]
+            answer_rows = [
+                {
+                    "doc_id": str(r["doc_id"]),
+                    "page_idx": int(r["page_idx"]),
+                    "base_score": float(r.get("score", 0.0)),
+                    "summary_text": _lookup_context(context_map, str(r["doc_id"]), int(r["page_idx"])) or "",
+                }
+                for r in ranked_for_answer
+            ]
+            follow_up_query, answer_trace_turn = _answer_conditioned_query_with_llm(
+                original_query=root_query,
+                current_query=current_query,
+                rows=answer_rows,
+                base_url=str(answer_base_url),
+                model=str(answer_model),
+                api_key=answer_api_key,
+                summary_max_chars=int(answer_summary_max_chars),
+                max_retries=int(answer_max_retries),
+                timeout_s=float(answer_timeout_s),
+                max_tokens=int(answer_max_tokens),
+                temperature=float(answer_temperature),
+                min_token_overlap=float(answer_min_token_overlap),
+                max_new_token_ratio=float(answer_max_new_token_ratio),
+                max_length_multiplier=float(answer_max_length_multiplier),
+                min_numeric_preservation=float(answer_min_numeric_preservation),
+            )
+            if _norm_text(follow_up_query) != _norm_text(current_query):
+                query_changed = True
+                current_query = _norm_text(follow_up_query)
+
         trace["turns"].append(
             {
                 "turn": int(turn),
@@ -1602,6 +1893,7 @@ def _iterative_expand_candidates(
                 "query_after_turn": _norm_text(current_query),
                 "query_changed": bool(query_changed),
                 "rewrite_trace": rewrite_trace_turn,
+                "answer_conditioned_trace": answer_trace_turn,
             }
         )
         if new_pages < max(0, int(min_new_pages)) and not query_changed:
@@ -1676,14 +1968,20 @@ def main() -> int:
         "rewrite_min_token_overlap",
         "rewrite_max_new_token_ratio",
         "rewrite_min_numeric_preservation",
+        "answer_min_token_overlap",
+        "answer_max_new_token_ratio",
+        "answer_min_numeric_preservation",
     ):
         v = float(getattr(args, name))
         if v < 0.0 or v > 1.0:
             raise ValueError(f"--{name.replace('_', '-')} must be within [0, 1]")
     if float(args.rewrite_max_length_multiplier) <= 0.0:
         raise ValueError("--rewrite-max-length-multiplier must be > 0")
+    if float(args.answer_max_length_multiplier) <= 0.0:
+        raise ValueError("--answer-max-length-multiplier must be > 0")
     llm_api_key = _read_api_key(args.llm_api_key_file)
     rewrite_api_key = _read_api_key(args.rewrite_api_key_file) if args.rewrite_api_key_file else llm_api_key
+    answer_api_key = _read_api_key(args.answer_api_key_file) if args.answer_api_key_file else rewrite_api_key
     if args.llm_rerank:
         if not args.llm_base_url:
             raise ValueError("--llm-rerank requires --llm-base-url")
@@ -1696,6 +1994,15 @@ def main() -> int:
             raise ValueError("--rewrite-query requires --rewrite-base-url or --llm-base-url")
         if not rewrite_model:
             raise ValueError("--rewrite-query requires --rewrite-model or --llm-model")
+    if args.answer_conditioned_retrieval:
+        if not args.iterative_retrieval:
+            raise ValueError("--answer-conditioned-retrieval requires --iterative-retrieval")
+        answer_base_url = args.answer_base_url or args.rewrite_base_url or args.llm_base_url
+        answer_model = args.answer_model or args.rewrite_model or args.llm_model
+        if not answer_base_url:
+            raise ValueError("--answer-conditioned-retrieval requires --answer-base-url or --rewrite-base-url or --llm-base-url")
+        if not answer_model:
+            raise ValueError("--answer-conditioned-retrieval requires --answer-model or --rewrite-model or --llm-model")
 
     qid_filter = {args.qid} if args.qid else None
     qids_allow = _load_qids_file(args.qids_file)
@@ -1765,6 +2072,8 @@ def main() -> int:
         if args.iterative_retrieval:
             rewrite_base_url = args.rewrite_base_url or args.llm_base_url
             rewrite_model = args.rewrite_model or args.llm_model
+            answer_base_url = args.answer_base_url or args.rewrite_base_url or args.llm_base_url
+            answer_model = args.answer_model or args.rewrite_model or args.llm_model
             cands, query, iterative_trace = _iterative_expand_candidates(
                 initial_candidates=cands,
                 root_query=_norm_text(original_query),
@@ -1788,6 +2097,20 @@ def main() -> int:
                 rewrite_max_new_token_ratio=float(args.rewrite_max_new_token_ratio),
                 rewrite_max_length_multiplier=float(args.rewrite_max_length_multiplier),
                 rewrite_min_numeric_preservation=float(args.rewrite_min_numeric_preservation),
+                answer_conditioned_retrieval=bool(args.answer_conditioned_retrieval),
+                answer_base_url=answer_base_url,
+                answer_model=answer_model,
+                answer_api_key=answer_api_key,
+                answer_context_candidates=int(args.answer_context_candidates),
+                answer_summary_max_chars=int(args.answer_summary_max_chars),
+                answer_max_retries=int(args.answer_max_retries),
+                answer_timeout_s=float(args.answer_timeout_s),
+                answer_max_tokens=int(args.answer_max_tokens),
+                answer_temperature=float(args.answer_temperature),
+                answer_min_token_overlap=float(args.answer_min_token_overlap),
+                answer_max_new_token_ratio=float(args.answer_max_new_token_ratio),
+                answer_max_length_multiplier=float(args.answer_max_length_multiplier),
+                answer_min_numeric_preservation=float(args.answer_min_numeric_preservation),
             )
             if args.rewrite_query and iterative_trace.get("turns"):
                 rewrite_trace = iterative_trace["turns"][-1].get("rewrite_trace", rewrite_trace)
@@ -1987,11 +2310,28 @@ def main() -> int:
             "original_query": _norm_text(original_query),
             "effective_query": _norm_text(query),
             "query_rewrite_trace": rewrite_trace,
+            "answer_conditioned_trace": (
+                iterative_trace["turns"][-1].get("answer_conditioned_trace")
+                if iterative_trace.get("turns")
+                else {
+                    "enabled": bool(args.answer_conditioned_retrieval),
+                    "attempted": False,
+                    "success": False,
+                    "error": None,
+                    "raw_reply_preview": None,
+                }
+            ),
             "rewrite_guard": {
                 "min_token_overlap": float(args.rewrite_min_token_overlap),
                 "max_new_token_ratio": float(args.rewrite_max_new_token_ratio),
                 "max_length_multiplier": float(args.rewrite_max_length_multiplier),
                 "min_numeric_preservation": float(args.rewrite_min_numeric_preservation),
+            },
+            "answer_guard": {
+                "min_token_overlap": float(args.answer_min_token_overlap),
+                "max_new_token_ratio": float(args.answer_max_new_token_ratio),
+                "max_length_multiplier": float(args.answer_max_length_multiplier),
+                "min_numeric_preservation": float(args.answer_min_numeric_preservation),
             },
             "iterative_trace": iterative_trace,
             "freeze_top_n": int(args.freeze_top_n),
@@ -2006,6 +2346,8 @@ def main() -> int:
     method_name = "metadata_rerank_baseline_plus_visual_lexicon"
     if args.iterative_retrieval:
         method_name = method_name + "_iterative_retrieval_agent"
+    if args.answer_conditioned_retrieval:
+        method_name = method_name + "_answer_conditioned"
 
     out: dict[str, Any] = {
         "meta": {
@@ -2030,6 +2372,20 @@ def main() -> int:
             "iterative_topk_per_turn": int(args.iterative_topk_per_turn),
             "iterative_max_pool": int(args.iterative_max_pool),
             "iterative_min_new_pages": int(args.iterative_min_new_pages),
+            "answer_conditioned_retrieval": bool(args.answer_conditioned_retrieval),
+            "answer_base_url": args.answer_base_url,
+            "answer_model": args.answer_model,
+            "answer_api_key_file": None if args.answer_api_key_file is None else str(args.answer_api_key_file),
+            "answer_context_candidates": int(args.answer_context_candidates),
+            "answer_summary_max_chars": int(args.answer_summary_max_chars),
+            "answer_max_retries": int(args.answer_max_retries),
+            "answer_timeout_s": float(args.answer_timeout_s),
+            "answer_max_tokens": int(args.answer_max_tokens),
+            "answer_temperature": float(args.answer_temperature),
+            "answer_min_token_overlap": float(args.answer_min_token_overlap),
+            "answer_max_new_token_ratio": float(args.answer_max_new_token_ratio),
+            "answer_max_length_multiplier": float(args.answer_max_length_multiplier),
+            "answer_min_numeric_preservation": float(args.answer_min_numeric_preservation),
             "freeze_top_n": int(args.freeze_top_n),
             "window_start_rank": int(args.window_start_rank),
             "window_end_rank": int(args.window_end_rank),
