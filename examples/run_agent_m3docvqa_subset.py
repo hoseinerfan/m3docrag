@@ -219,6 +219,29 @@ def parse_args():
         help="Optional prompt template file for RetrieverAgent reranker. Supports {query}, {max_select_docs}, {candidates}.",
     )
     p.add_argument(
+        "--selection-answer-conditioned",
+        action="store_true",
+        help=(
+            "Enable true answer-conditioned hop chaining in --selection-only mode. "
+            "After each turn, extract an intermediate fact from retrieved evidence and generate the next query from that fact."
+        ),
+    )
+    p.add_argument(
+        "--selection-answer-context-candidates",
+        type=int,
+        default=6,
+        help="Max evidence snippets shown to the answer-conditioned follow-up generator per turn.",
+    )
+    p.add_argument(
+        "--selection-answer-prompt-file",
+        type=Path,
+        default=None,
+        help=(
+            "Optional prompt template file for answer-conditioned follow-up generation. "
+            "Supports {question}, {current_query}, {turn}, {max_hops}, {evidence}, {previous_intermediate_answers}."
+        ),
+    )
+    p.add_argument(
         "--selection-topk-docs-per-hop",
         type=int,
         default=2,
@@ -886,6 +909,201 @@ def _selection_retriever_prompt(
         "- choose from listed candidates only.\n"
         "- no extra keys, no markdown, no explanation.\n"
     )
+
+
+def _selection_answer_conditioned_prompt(
+    *,
+    question: str,
+    current_query: str,
+    turn: int,
+    max_hops: int,
+    evidence_lines: list[str],
+    previous_intermediate_answers: list[str],
+    prompt_template: Optional[str] = None,
+) -> str:
+    evidence = "\n".join(evidence_lines)
+    prior_answers = "\n".join(
+        [f"- {a}" for a in previous_intermediate_answers if _norm_text(a)]
+    ) or "None"
+    rendered = _render_prompt_template(
+        prompt_template,
+        {
+            "question": question,
+            "current_query": current_query,
+            "turn": turn,
+            "max_hops": max(max_hops, 1),
+            "evidence": evidence,
+            "previous_intermediate_answers": prior_answers,
+        },
+    )
+    if rendered:
+        return rendered
+    return (
+        "You are a multi-hop retrieval planner.\n"
+        "Given the original question and evidence from the current retrieval turn,\n"
+        "infer one intermediate fact and produce the next follow-up retrieval query.\n\n"
+        f"ORIGINAL_QUESTION:\n{question}\n\n"
+        f"CURRENT_QUERY (turn {turn}/{max(max_hops, 1)}):\n{current_query}\n\n"
+        f"PREVIOUS_INTERMEDIATE_ANSWERS:\n{prior_answers}\n\n"
+        f"EVIDENCE_SNIPPETS:\n{evidence}\n\n"
+        "Return JSON only:\n"
+        "{\n"
+        '  "intermediate_answer": "<short factual phrase from evidence>",\n'
+        '  "next_query": "<follow-up retrieval query conditioned on the intermediate answer>"\n'
+        "}\n"
+        "Rules:\n"
+        "- Keep entities, years, and numbers consistent with the original question.\n"
+        "- next_query must differ from current_query.\n"
+        "- Do not answer the final question; only provide the next retrieval query.\n"
+    )
+
+
+def _parse_selection_answer_conditioned_response(
+    *,
+    raw_reply: str,
+    current_query: str,
+) -> tuple[Optional[str], Optional[str]]:
+    intermediate_answer = None
+    next_query = None
+    payload = _extract_first_json_object(raw_reply)
+    if isinstance(payload, dict):
+        for key in ("intermediate_answer", "answer", "fact", "intermediate_fact"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                intermediate_answer = _norm_text(value)
+                break
+        for key in ("next_query", "follow_up_query", "hop_query", "retrieval_query", "query"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                next_query = _norm_text(value)
+                break
+
+    if next_query is None and raw_reply:
+        for line in raw_reply.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            lower = line.casefold()
+            if lower.startswith("next_query:") or lower.startswith("follow_up_query:"):
+                next_query = _norm_text(line.split(":", 1)[1])
+                break
+            if lower.startswith("intermediate_answer:") and intermediate_answer is None:
+                intermediate_answer = _norm_text(line.split(":", 1)[1])
+
+    if next_query and next_query.casefold() == _norm_text(current_query).casefold():
+        next_query = None
+    return intermediate_answer, next_query
+
+
+def _build_answer_conditioned_evidence_lines(
+    *,
+    selected_pages: list[tuple[str, int, float]],
+    top_pages_payload: list[dict],
+    page_summary_map: Optional[dict[str, str]],
+    max_items: int,
+) -> list[str]:
+    lines: list[str] = []
+    seen: set[str] = set()
+
+    # Prefer pages explicitly selected this turn, then backfill with top retrieved pages.
+    for doc_id, page_idx, score in selected_pages:
+        uid = f"{doc_id}#p{int(page_idx)}"
+        if uid in seen:
+            continue
+        seen.add(uid)
+        summary = _lookup_page_summary(page_summary_map, str(doc_id), int(page_idx)) or ""
+        lines.append(
+            f"[{len(lines)+1}] doc_id={doc_id} page_idx={int(page_idx)} score={float(score):.4f} "
+            f"summary={_norm_text(summary)[:240]}"
+        )
+        if len(lines) >= max(max_items, 1):
+            return lines
+
+    for row in top_pages_payload:
+        doc_id = str(row.get("doc_id") or "")
+        page_idx = int(row.get("page_idx") or 0)
+        uid = f"{doc_id}#p{page_idx}"
+        if not doc_id or uid in seen:
+            continue
+        seen.add(uid)
+        summary = _norm_text(str(row.get("page_summary") or ""))[:240]
+        score = float(row.get("score") or 0.0)
+        lines.append(
+            f"[{len(lines)+1}] doc_id={doc_id} page_idx={page_idx} score={score:.4f} summary={summary}"
+        )
+        if len(lines) >= max(max_items, 1):
+            break
+    return lines
+
+
+def _propose_answer_conditioned_follow_up_query(
+    *,
+    question: str,
+    current_query: str,
+    turn: int,
+    max_hops: int,
+    selected_pages: list[tuple[str, int, float]],
+    top_pages_payload: list[dict],
+    page_summary_map: Optional[dict[str, str]],
+    llm_call: Optional[Callable[[str], str]],
+    context_candidates: int,
+    previous_intermediate_answers: list[str],
+    prompt_template: Optional[str] = None,
+) -> tuple[Optional[str], Optional[str], dict]:
+    trace = {
+        "attempted": bool(llm_call),
+        "success": False,
+        "error": None,
+        "intermediate_answer": None,
+        "next_query": None,
+        "raw_reply_preview": None,
+        "evidence_count": 0,
+    }
+    if llm_call is None:
+        trace["error"] = "llm_unavailable"
+        return None, None, trace
+
+    evidence_lines = _build_answer_conditioned_evidence_lines(
+        selected_pages=selected_pages,
+        top_pages_payload=top_pages_payload,
+        page_summary_map=page_summary_map,
+        max_items=max(context_candidates, 1),
+    )
+    trace["evidence_count"] = len(evidence_lines)
+    if not evidence_lines:
+        trace["error"] = "no_evidence"
+        return None, None, trace
+
+    prompt = _selection_answer_conditioned_prompt(
+        question=question,
+        current_query=current_query,
+        turn=turn,
+        max_hops=max_hops,
+        evidence_lines=evidence_lines,
+        previous_intermediate_answers=previous_intermediate_answers,
+        prompt_template=prompt_template,
+    )
+    try:
+        raw_reply = llm_call(prompt) or ""
+    except Exception as exc:
+        trace["error"] = str(exc)
+        return None, None, trace
+
+    trace["raw_reply_preview"] = _norm_text(raw_reply)[:400]
+    intermediate_answer, next_query = _parse_selection_answer_conditioned_response(
+        raw_reply=raw_reply,
+        current_query=current_query,
+    )
+    if next_query is None:
+        trace["error"] = "missing_next_query"
+        if intermediate_answer:
+            trace["intermediate_answer"] = intermediate_answer
+        return None, intermediate_answer, trace
+
+    trace["success"] = True
+    trace["next_query"] = next_query
+    trace["intermediate_answer"] = intermediate_answer
+    return next_query, intermediate_answer, trace
 
 
 def _parse_selection_retriever_response(
@@ -1647,6 +1865,10 @@ def run_selection_only_session(
     selection_retriever_select_docs: int = 12,
     selection_retriever_llm_call: Optional[Callable[[str], str]] = None,
     selection_retriever_prompt_template: Optional[str] = None,
+    selection_answer_conditioned: bool = False,
+    selection_answer_llm_call: Optional[Callable[[str], str]] = None,
+    selection_answer_context_candidates: int = 6,
+    selection_answer_prompt_template: Optional[str] = None,
     page_summary_map: Optional[dict[str, str]] = None,
     page_visual_meta_map: Optional[dict[str, dict[str, float | bool]]] = None,
     selection_visual_boost: float = 2.0,
@@ -1668,6 +1890,8 @@ def run_selection_only_session(
         len(hop_queries),
         hop_queries,
     )
+    if selection_answer_conditioned:
+        logger.info("selection-only answer-conditioned chaining enabled.")
     if page_summary_map:
         logger.info("selection-only summary rerank active: {} page summaries loaded", len(page_summary_map))
     if page_visual_meta_map:
@@ -1692,8 +1916,19 @@ def run_selection_only_session(
         depth_multiplier=selection_retrieval_depth_multiplier,
     )
     final_reason = "selection_only"
+    planned_queries = list(hop_queries)
+    if selection_answer_conditioned and planned_queries:
+        dynamic_queries = [planned_queries[0]]
+        planner_backfill_queries = planned_queries[1:]
+    else:
+        dynamic_queries = list(planned_queries)
+        planner_backfill_queries = []
+    intermediate_answers: list[str] = []
 
-    for turn, hop_query in enumerate(hop_queries, start=1):
+    for turn in range(1, max(selection_max_hop_queries, 1) + 1):
+        if turn > len(dynamic_queries):
+            break
+        hop_query = dynamic_queries[turn - 1]
         if turn == 1 and selection_root_topk_docs is not None:
             selection_quota = max(selection_root_topk_docs, 0)
         elif turn > 1 and selection_variant_topk_docs is not None:
@@ -1745,6 +1980,16 @@ def run_selection_only_session(
                 prompt_template=selection_retriever_prompt_template,
             )
 
+        top_pages_payload = _top_pages_payload_from_pages(
+            retrieved_for_selection,
+            limit=query_retrieval_depth,
+            page_summary_map=page_summary_map,
+            page_visual_meta_map=page_visual_meta_map,
+            query=hop_query,
+            descriptor_focused=descriptor_focused,
+            visual_boost=selection_visual_boost,
+            min_visual_confidence=selection_visual_min_confidence,
+        )
         top_docs = _top_docs_payload_from_pages(
             retrieved_for_selection,
             limit=query_retrieval_depth,
@@ -1769,18 +2014,67 @@ def run_selection_only_session(
         )
         new_selected_docs = sorted(selected_doc_ids - selected_doc_ids_before)
         new_selected_doc_count = len(new_selected_docs)
+        next_query = None
+        intermediate_answer = None
+        answer_conditioned_trace = None
+        if selection_answer_conditioned and turn < max(selection_max_hop_queries, 1):
+            next_query, intermediate_answer, answer_conditioned_trace = _propose_answer_conditioned_follow_up_query(
+                question=question,
+                current_query=hop_query,
+                turn=turn,
+                max_hops=max(selection_max_hop_queries, 1),
+                selected_pages=selected_pages,
+                top_pages_payload=top_pages_payload,
+                page_summary_map=page_summary_map,
+                llm_call=selection_answer_llm_call,
+                context_candidates=selection_answer_context_candidates,
+                previous_intermediate_answers=intermediate_answers,
+                prompt_template=selection_answer_prompt_template,
+            )
+            if intermediate_answer:
+                intermediate_answers.append(intermediate_answer)
+
+            if next_query:
+                existing = {q.casefold() for q in dynamic_queries}
+                if next_query.casefold() not in existing:
+                    dynamic_queries.append(next_query)
+                elif answer_conditioned_trace is not None:
+                    answer_conditioned_trace["success"] = False
+                    answer_conditioned_trace["error"] = "duplicate_next_query"
+                    next_query = None
+
+            # Backfill with planner-generated queries when conditioned follow-up is unavailable.
+            if next_query is None and planner_backfill_queries:
+                fallback_query = planner_backfill_queries.pop(0)
+                existing = {q.casefold() for q in dynamic_queries}
+                if fallback_query.casefold() not in existing:
+                    dynamic_queries.append(fallback_query)
+                    if answer_conditioned_trace is None:
+                        answer_conditioned_trace = {
+                            "attempted": False,
+                            "success": False,
+                            "error": "planner_backfill",
+                            "intermediate_answer": intermediate_answer,
+                            "next_query": fallback_query,
+                            "raw_reply_preview": None,
+                            "evidence_count": 0,
+                        }
+                    else:
+                        answer_conditioned_trace["fallback_query"] = fallback_query
 
         steps.append(
             {
                 "turn": turn,
                 "query": hop_query,
                 "selected_pages": selected_pages,
-                "answer": None,
+                "answer": intermediate_answer,
                 "stop_reason": None,
                 "action_type": "selection_only",
-                "facts_added": [],
+                "facts_added": ([intermediate_answer] if intermediate_answer else []),
                 "new_selected_doc_count": new_selected_doc_count,
                 "new_selected_doc_ids": new_selected_docs,
+                "next_query": next_query,
+                "answer_conditioned_trace": answer_conditioned_trace,
                 "retrieval_traces": [
                     {
                         "query": hop_query,
@@ -1788,16 +2082,7 @@ def run_selection_only_session(
                         "returned_page_count": len(retrieved),
                         "metadata_full_scan_candidates": len(metadata_candidates),
                         "retriever_agent": retriever_agent_trace,
-                        "top_pages": _top_pages_payload_from_pages(
-                            retrieved_for_selection,
-                            limit=query_retrieval_depth,
-                            page_summary_map=page_summary_map,
-                            page_visual_meta_map=page_visual_meta_map,
-                            query=hop_query,
-                            descriptor_focused=descriptor_focused,
-                            visual_boost=selection_visual_boost,
-                            min_visual_confidence=selection_visual_min_confidence,
-                        ),
+                        "top_pages": top_pages_payload,
                         "top_docs": top_docs,
                     }
                 ],
@@ -1814,7 +2099,8 @@ def run_selection_only_session(
         "steps": steps,
             "selection_plan": {
                 "planner_reply": planner_reply,
-                "hop_queries": hop_queries,
+                "hop_queries": planned_queries,
+                "executed_queries": [str(step.get("query") or "") for step in steps],
                 "planner_backend": selection_planner_backend,
                 "planner_prompt_template_used": bool(selection_planner_prompt_template),
                 "topk_docs_per_hop": selection_topk_docs_per_hop,
@@ -1835,6 +2121,9 @@ def run_selection_only_session(
                 "selection_retriever_candidate_docs": selection_retriever_candidate_docs,
                 "selection_retriever_select_docs": selection_retriever_select_docs,
                 "selection_retriever_prompt_template_used": bool(selection_retriever_prompt_template),
+                "selection_answer_conditioned": selection_answer_conditioned,
+                "selection_answer_context_candidates": selection_answer_context_candidates,
+                "selection_answer_prompt_template_used": bool(selection_answer_prompt_template),
                 "selection_visual_boost": selection_visual_boost,
                 "selection_visual_min_confidence": selection_visual_min_confidence,
             },
@@ -2254,10 +2543,11 @@ def main():
     policy_device = args.policy_device or args.device
     selection_planner_prompt_template = _read_text_file_optional(args.selection_planner_prompt_file)
     selection_retriever_prompt_template = _read_text_file_optional(args.selection_retriever_prompt_file)
+    selection_answer_prompt_template = _read_text_file_optional(args.selection_answer_prompt_file)
 
     selection_needs_llm = bool(args.selection_retriever_agent) or (
         args.selection_only and args.selection_planner_backend == "llm"
-    )
+    ) or bool(args.selection_only and args.selection_answer_conditioned)
 
     if args.selection_only:
         llm_call = None
@@ -2284,16 +2574,19 @@ def main():
             logger.info("Selection-only mode uses heuristic planner and no RetrieverAgent LLM reranking.")
         selection_planner_llm_call = llm_call if args.selection_planner_backend == "llm" else None
         selection_retriever_llm_call = llm_call if args.selection_retriever_agent else None
+        selection_answer_llm_call = llm_call if args.selection_answer_conditioned else None
     elif args.policy_backend == "stub":
         llm_call = make_llm_call_stub()
         selection_planner_llm_call = None
         selection_retriever_llm_call = None
+        selection_answer_llm_call = None
     elif args.policy_backend == "local-hf":
         if not args.policy_model:
             raise ValueError("--policy-model is required when --policy-backend local-hf")
         llm_call = make_llm_call_local_hf(args.policy_model, device=policy_device)
         selection_planner_llm_call = None
         selection_retriever_llm_call = None
+        selection_answer_llm_call = None
     else:
         llm_call = make_llm_call_openai_api(
             base_url=str(args.policy_base_url or ""),
@@ -2306,6 +2599,7 @@ def main():
         )
         selection_planner_llm_call = None
         selection_retriever_llm_call = None
+        selection_answer_llm_call = None
 
     cache = DocCache(
         embeddings_dir=embeddings_dir,
@@ -2441,6 +2735,10 @@ def main():
                         selection_retriever_select_docs=args.selection_retriever_select_docs,
                         selection_retriever_llm_call=selection_retriever_llm_call,
                         selection_retriever_prompt_template=selection_retriever_prompt_template,
+                        selection_answer_conditioned=args.selection_answer_conditioned,
+                        selection_answer_llm_call=selection_answer_llm_call,
+                        selection_answer_context_candidates=args.selection_answer_context_candidates,
+                        selection_answer_prompt_template=selection_answer_prompt_template,
                         page_summary_map=page_summary_map,
                         page_visual_meta_map=page_visual_meta_map,
                         selection_visual_boost=args.selection_visual_boost,
@@ -2548,6 +2846,11 @@ def main():
             "selection_retriever_select_docs": args.selection_retriever_select_docs,
             "selection_retriever_prompt_file": (
                 str(args.selection_retriever_prompt_file) if args.selection_retriever_prompt_file else None
+            ),
+            "selection_answer_conditioned": args.selection_answer_conditioned,
+            "selection_answer_context_candidates": args.selection_answer_context_candidates,
+            "selection_answer_prompt_file": (
+                str(args.selection_answer_prompt_file) if args.selection_answer_prompt_file else None
             ),
             "page_summaries_file": (str(args.page_summaries_file) if args.page_summaries_file else None),
             "page_visual_metadata_file": (

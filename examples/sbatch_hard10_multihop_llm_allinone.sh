@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH -J hard10_mhop_all
 #SBATCH -p gpu
-#SBATCH --gres=gpu:1
+#SBATCH --gres=gpu:2
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=200G
 #SBATCH -t 12:00:00
@@ -25,6 +25,9 @@ MODEL_PATH="${MODEL_PATH:-/mmfs1/scratch/jacks.local/aerfanshekooh/custom/models
 MODEL_NAME="${MODEL_NAME:-Qwen/Qwen2.5-VL-32B-Instruct}"
 VLLM_PORT="${VLLM_PORT:-8010}"
 BASE_URL="http://127.0.0.1:${VLLM_PORT}/v1"
+VLLM_CUDA_DEVICES="${VLLM_CUDA_DEVICES:-0}"
+AGENT_CUDA_DEVICES="${AGENT_CUDA_DEVICES:-1}"
+AGENT_DEVICE="${AGENT_DEVICE:-cuda}"
 
 OUT_JSONL="${OUT_JSONL:-$ROOT/outputs/agent_simpledoc_hard10_multihop.jsonl}"
 OUT_SUMMARY="${OUT_SUMMARY:-$ROOT/outputs/agent_simpledoc_hard10_multihop_summary.json}"
@@ -54,7 +57,7 @@ export HF_HOME="$SHORT/hf"
 export TMPDIR="$SHORT/tmp"
 
 conda activate "$ROOT/.conda/vllm_server"
-python -m vllm.entrypoints.openai.api_server \
+CUDA_VISIBLE_DEVICES="$VLLM_CUDA_DEVICES" python -m vllm.entrypoints.openai.api_server \
   --host 127.0.0.1 \
   --port "$VLLM_PORT" \
   --model "$MODEL_PATH" \
@@ -77,6 +80,9 @@ echo "vLLM ready at ${BASE_URL}"
 
 conda activate "$ROOT/.conda/m3docrag"
 cd "$ROOT/m3docrag"
+if [[ "$AGENT_DEVICE" == "cuda" ]]; then
+  export CUDA_VISIBLE_DEVICES="$AGENT_CUDA_DEVICES"
+fi
 python "$ROOT/m3docrag/examples/run_agent_m3docvqa_subset.py" \
   --split dev \
   --mmqa-jsonl "$MMQA_DEV" \
@@ -91,6 +97,8 @@ python "$ROOT/m3docrag/examples/run_agent_m3docvqa_subset.py" \
   --selection-only \
   --selection-profile default \
   --selection-planner-backend llm \
+  --selection-answer-conditioned \
+  --selection-answer-context-candidates 6 \
   --policy-backend openai-api \
   --policy-model "$MODEL_NAME" \
   --policy-base-url "$BASE_URL" \
@@ -104,7 +112,7 @@ python "$ROOT/m3docrag/examples/run_agent_m3docvqa_subset.py" \
   --selection-retrieval-depth-multiplier 10 \
   --selection-candidate-multi-page \
   --page-summaries-file "$BASE_META" \
-  --device cuda \
+  --device "$AGENT_DEVICE" \
   --output-jsonl "$OUT_JSONL" \
   --summary-json "$OUT_SUMMARY"
 

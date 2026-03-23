@@ -69,6 +69,8 @@ python "$ROOT/m3docrag/examples/run_agent_m3docvqa_subset.py" \
   --selection-only \
   --selection-profile default \
   --selection-planner-backend llm \
+  --selection-answer-conditioned \
+  --selection-answer-context-candidates 6 \
   --policy-backend openai-api \
   --policy-model "$MODEL" \
   --policy-base-url "$BASE_URL" \
