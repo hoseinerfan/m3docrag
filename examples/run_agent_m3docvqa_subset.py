@@ -898,7 +898,10 @@ def _parse_selection_retriever_response(
         return []
 
     candidate_by_index = {idx + 1: row for idx, row in enumerate(candidate_rows)}
-    candidate_by_doc = {str(doc_id): row for doc_id, page_idx, score in candidate_rows}
+    candidate_by_doc = {
+        str(doc_id): (str(doc_id), int(page_idx), float(score))
+        for doc_id, page_idx, score in candidate_rows
+    }
     picked: list[tuple[str, int, float]] = []
     picked_uids: set[str] = set()
 
