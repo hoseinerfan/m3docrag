@@ -93,8 +93,8 @@ if [[ ! -s "$SHARD_DOCS" ]]; then
   exit 0
 fi
 
-# Keep Triton/vLLM cache off $HOME to avoid quota failures.
-CACHE_BASE="${CACHE_BASE:-$ROOT/.cache/vllm_job_${SLURM_JOB_ID:-manual}_shard_${SHARD_ID}}"
+# Keep cache/tmp paths very short; vLLM uses Unix IPC sockets with a strict path length limit.
+CACHE_BASE="${CACHE_BASE:-/tmp/vllm_${SLURM_JOB_ID:-manual}_${SHARD_ID}}"
 mkdir -p "$CACHE_BASE/tmp" "$CACHE_BASE/xdg" "$CACHE_BASE/triton" "$CACHE_BASE/torchinductor"
 export TMPDIR="$CACHE_BASE/tmp"
 export XDG_CACHE_HOME="$CACHE_BASE/xdg"
@@ -102,6 +102,7 @@ export TRITON_CACHE_DIR="$CACHE_BASE/triton"
 export TORCHINDUCTOR_CACHE_DIR="$CACHE_BASE/torchinductor"
 export VLLM_NO_USAGE_STATS=1
 export VLLM_DO_NOT_TRACK=1
+unset VLLM_NODE VLLM_JOB VLLM_PID || true
 
 VLLM_LOG="$ROOT/logs/vllm_${SLURM_JOB_ID:-manual}_${SHARD_ID}.log"
 "$PY_VLLM" -m vllm.entrypoints.openai.api_server \
