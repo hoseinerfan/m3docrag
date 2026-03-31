@@ -322,6 +322,14 @@ def parse_args():
         help="Max docs/pages parsed from RetrieverAgent output per query in --selection-only mode.",
     )
     p.add_argument(
+        "--selection-retriever-require-success",
+        action="store_true",
+        help=(
+            "Fail the run when RetrieverAgent LLM reranking fails or cannot be parsed "
+            "instead of silently falling back to non-LLM ordering."
+        ),
+    )
+    p.add_argument(
         "--selection-final-global-rerank",
         action="store_true",
         help=(
@@ -343,6 +351,18 @@ def parse_args():
         type=int,
         default=10,
         help="Final number of docs kept after global rerank in --selection-only mode.",
+    )
+    p.add_argument(
+        "--selection-final-rerank-chunk-size",
+        type=int,
+        default=40,
+        help="Chunk size for tournament-style final global rerank when candidate docs are large.",
+    )
+    p.add_argument(
+        "--selection-final-rerank-chunk-keep",
+        type=int,
+        default=10,
+        help="Docs kept per chunk during tournament-style final global rerank.",
     )
     p.add_argument(
         "--page-summaries-file",
@@ -1207,6 +1227,7 @@ def _rerank_with_selection_retriever_agent(
     llm_call: Optional[Callable[[str], str]],
     candidate_doc_limit: int,
     max_select_docs: int,
+    require_success: bool = False,
     prompt_template: Optional[str] = None,
 ) -> tuple[list[tuple[str, int, float]], dict]:
     trace = {
@@ -1220,6 +1241,8 @@ def _rerank_with_selection_retriever_agent(
     }
     if not retrieved or llm_call is None:
         trace["enabled"] = False
+        if require_success:
+            raise RuntimeError("RetrieverAgent rerank requires non-empty candidates and an LLM call.")
         return retrieved, trace
 
     candidate_rows: list[tuple[str, int, float]] = []
@@ -1258,6 +1281,8 @@ def _rerank_with_selection_retriever_agent(
         raw_reply = llm_call(prompt)
     except Exception as exc:
         trace["error"] = str(exc)
+        if require_success:
+            raise RuntimeError(f"RetrieverAgent LLM call failed: {exc}") from exc
         return retrieved, trace
 
     raw_reply = raw_reply or ""
@@ -1268,6 +1293,12 @@ def _rerank_with_selection_retriever_agent(
         max_select_docs=max_select_docs,
     )
     if not selected_rows:
+        if require_success:
+            preview = trace.get("raw_reply_preview") or ""
+            raise RuntimeError(
+                "RetrieverAgent response parse failed. "
+                f"Preview={preview[:200]!r}"
+            )
         return retrieved, trace
 
     trace["parse_success"] = True
@@ -1797,7 +1828,10 @@ def _final_global_rerank_docs(
     final_topk_docs: int,
     use_retriever_agent: bool,
     retriever_llm_call: Optional[Callable[[str], str]],
+    retriever_require_success: bool,
     retriever_prompt_template: Optional[str],
+    rerank_chunk_size: int,
+    rerank_chunk_keep: int,
     visual_boost: float,
     min_visual_confidence: float,
 ) -> tuple[list[tuple[str, int, float]], dict]:
@@ -1849,15 +1883,87 @@ def _final_global_rerank_docs(
         pre_llm_rows = pre_llm_rows[:candidate_doc_limit]
 
     retriever_trace = None
+    tournament_trace = {
+        "enabled": bool(use_retriever_agent and retriever_llm_call is not None),
+        "chunk_size": max(int(rerank_chunk_size), 1),
+        "chunk_keep": max(int(rerank_chunk_keep), 1),
+        "rounds": [],
+    }
     reranked_rows = pre_llm_rows
     if use_retriever_agent and retriever_llm_call is not None and pre_llm_rows:
+        chunk_size = max(int(rerank_chunk_size), 1)
+        chunk_keep = max(int(rerank_chunk_keep), 1)
+        stage_rows = list(pre_llm_rows)
+        round_idx = 1
+
+        # Tournament rerank: process large candidate sets in chunks to avoid prompt overflows.
+        while len(stage_rows) > chunk_size:
+            chunks = [stage_rows[i : i + chunk_size] for i in range(0, len(stage_rows), chunk_size)]
+            next_stage: list[tuple[str, int, float]] = []
+            round_rows_before = len(stage_rows)
+            round_info = {
+                "round": round_idx,
+                "rows_before": round_rows_before,
+                "num_chunks": len(chunks),
+                "chunk_results": [],
+            }
+            for chunk_idx, chunk in enumerate(chunks, start=1):
+                select_k = min(chunk_keep, len(chunk))
+                chunk_reranked, chunk_trace = _rerank_with_selection_retriever_agent(
+                    query=question,
+                    retrieved=chunk,
+                    page_summary_map=page_summary_map,
+                    llm_call=retriever_llm_call,
+                    candidate_doc_limit=len(chunk),
+                    max_select_docs=select_k,
+                    require_success=retriever_require_success,
+                    prompt_template=retriever_prompt_template,
+                )
+                picked_chunk: list[tuple[str, int, float]] = []
+                picked_seen: set[str] = set()
+                for doc_id, page_idx, score in chunk_reranked:
+                    doc_id = str(doc_id)
+                    if doc_id in picked_seen:
+                        continue
+                    picked_seen.add(doc_id)
+                    picked_chunk.append((doc_id, int(page_idx), float(score)))
+                    if len(picked_chunk) >= select_k:
+                        break
+                next_stage.extend(picked_chunk)
+                round_info["chunk_results"].append(
+                    {
+                        "chunk_index": chunk_idx,
+                        "chunk_size": len(chunk),
+                        "picked": len(picked_chunk),
+                        "retriever_agent": chunk_trace,
+                    }
+                )
+
+            dedup_stage: list[tuple[str, int, float]] = []
+            dedup_seen: set[str] = set()
+            for doc_id, page_idx, score in next_stage:
+                doc_id = str(doc_id)
+                if doc_id in dedup_seen:
+                    continue
+                dedup_seen.add(doc_id)
+                dedup_stage.append((doc_id, int(page_idx), float(score)))
+            stage_rows = dedup_stage
+            round_info["rows_after"] = len(stage_rows)
+            tournament_trace["rounds"].append(round_info)
+            round_idx += 1
+            if round_idx > 10:
+                if retriever_require_success:
+                    raise RuntimeError("Final global rerank exceeded max tournament rounds (10).")
+                break
+
         reranked_rows, retriever_trace = _rerank_with_selection_retriever_agent(
             query=question,
-            retrieved=pre_llm_rows,
+            retrieved=stage_rows,
             page_summary_map=page_summary_map,
             llm_call=retriever_llm_call,
-            candidate_doc_limit=candidate_doc_limit,
+            candidate_doc_limit=min(len(stage_rows), chunk_size),
             max_select_docs=max(final_topk_docs, 1),
+            require_success=retriever_require_success,
             prompt_template=retriever_prompt_template,
         )
 
@@ -1877,6 +1983,8 @@ def _final_global_rerank_docs(
         "candidate_docs_unique": len(unique_rows),
         "candidate_doc_limit": candidate_doc_limit,
         "used_retriever_agent": bool(use_retriever_agent and retriever_llm_call is not None),
+        "retriever_require_success": bool(retriever_require_success),
+        "tournament": tournament_trace,
         "retriever_agent": retriever_trace,
         "pre_rerank_top_docs": _top_docs_payload_from_pages(
             pre_llm_rows,
@@ -2001,9 +2109,12 @@ def run_selection_only_session(
     selection_retriever_agent: bool = False,
     selection_retriever_candidate_docs: int = 40,
     selection_retriever_select_docs: int = 12,
+    selection_retriever_require_success: bool = False,
     selection_final_global_rerank: bool = False,
     selection_final_candidate_docs: Optional[int] = None,
     selection_final_topk_docs: int = 10,
+    selection_final_rerank_chunk_size: int = 40,
+    selection_final_rerank_chunk_keep: int = 10,
     selection_retriever_llm_call: Optional[Callable[[str], str]] = None,
     selection_retriever_prompt_template: Optional[str] = None,
     selection_answer_conditioned: bool = False,
@@ -2045,10 +2156,14 @@ def run_selection_only_session(
     )
     if selection_final_global_rerank:
         logger.info(
-            "selection-only final global rerank active: candidate_docs={} topk={}",
+            "selection-only final global rerank active: candidate_docs={} topk={} chunk_size={} chunk_keep={}",
             final_candidate_doc_limit,
             max(int(selection_final_topk_docs), 1),
+            max(int(selection_final_rerank_chunk_size), 1),
+            max(int(selection_final_rerank_chunk_keep), 1),
         )
+    if selection_retriever_require_success:
+        logger.info("selection-only retriever strict mode enabled: no non-LLM fallback.")
     doc_page_index = _build_doc_page_index(page_summary_map, page_visual_meta_map, set(docid2embs.keys()))
     if selection_summary_full_scan and doc_page_index:
         logger.info(
@@ -2133,6 +2248,7 @@ def run_selection_only_session(
                 llm_call=selection_retriever_llm_call,
                 candidate_doc_limit=selection_retriever_candidate_docs,
                 max_select_docs=selection_retriever_select_docs,
+                require_success=selection_retriever_require_success,
                 prompt_template=selection_retriever_prompt_template,
             )
 
@@ -2276,9 +2392,12 @@ def run_selection_only_session(
                 "selection_retriever_agent": selection_retriever_agent,
                 "selection_retriever_candidate_docs": selection_retriever_candidate_docs,
                 "selection_retriever_select_docs": selection_retriever_select_docs,
+                "selection_retriever_require_success": selection_retriever_require_success,
                 "selection_final_global_rerank": selection_final_global_rerank,
                 "selection_final_candidate_docs": final_candidate_doc_limit,
                 "selection_final_topk_docs": selection_final_topk_docs,
+                "selection_final_rerank_chunk_size": selection_final_rerank_chunk_size,
+                "selection_final_rerank_chunk_keep": selection_final_rerank_chunk_keep,
                 "selection_retriever_prompt_template_used": bool(selection_retriever_prompt_template),
                 "selection_answer_conditioned": selection_answer_conditioned,
                 "selection_answer_context_candidates": selection_answer_context_candidates,
@@ -2297,7 +2416,10 @@ def run_selection_only_session(
             final_topk_docs=max(int(selection_final_topk_docs), 1),
             use_retriever_agent=selection_retriever_agent,
             retriever_llm_call=selection_retriever_llm_call,
+            retriever_require_success=selection_retriever_require_success,
             retriever_prompt_template=selection_retriever_prompt_template,
+            rerank_chunk_size=selection_final_rerank_chunk_size,
+            rerank_chunk_keep=selection_final_rerank_chunk_keep,
             visual_boost=selection_visual_boost,
             min_visual_confidence=selection_visual_min_confidence,
         )
@@ -2948,9 +3070,12 @@ def main():
                         selection_retriever_agent=args.selection_retriever_agent,
                         selection_retriever_candidate_docs=args.selection_retriever_candidate_docs,
                         selection_retriever_select_docs=args.selection_retriever_select_docs,
+                        selection_retriever_require_success=args.selection_retriever_require_success,
                         selection_final_global_rerank=args.selection_final_global_rerank,
                         selection_final_candidate_docs=args.selection_final_candidate_docs,
                         selection_final_topk_docs=args.selection_final_topk_docs,
+                        selection_final_rerank_chunk_size=args.selection_final_rerank_chunk_size,
+                        selection_final_rerank_chunk_keep=args.selection_final_rerank_chunk_keep,
                         selection_retriever_llm_call=selection_retriever_llm_call,
                         selection_retriever_prompt_template=selection_retriever_prompt_template,
                         selection_answer_conditioned=args.selection_answer_conditioned,
@@ -3062,9 +3187,12 @@ def main():
             "selection_retriever_agent": args.selection_retriever_agent,
             "selection_retriever_candidate_docs": args.selection_retriever_candidate_docs,
             "selection_retriever_select_docs": args.selection_retriever_select_docs,
+            "selection_retriever_require_success": args.selection_retriever_require_success,
             "selection_final_global_rerank": args.selection_final_global_rerank,
             "selection_final_candidate_docs": args.selection_final_candidate_docs,
             "selection_final_topk_docs": args.selection_final_topk_docs,
+            "selection_final_rerank_chunk_size": args.selection_final_rerank_chunk_size,
+            "selection_final_rerank_chunk_keep": args.selection_final_rerank_chunk_keep,
             "selection_retriever_prompt_file": (
                 str(args.selection_retriever_prompt_file) if args.selection_retriever_prompt_file else None
             ),
