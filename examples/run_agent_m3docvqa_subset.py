@@ -322,6 +322,29 @@ def parse_args():
         help="Max docs/pages parsed from RetrieverAgent output per query in --selection-only mode.",
     )
     p.add_argument(
+        "--selection-final-global-rerank",
+        action="store_true",
+        help=(
+            "After all hops, aggregate a union of candidate docs and run one final global rerank "
+            "before trimming to --selection-final-topk-docs."
+        ),
+    )
+    p.add_argument(
+        "--selection-final-candidate-docs",
+        type=int,
+        default=None,
+        help=(
+            "Unique candidate docs retained for the final global rerank. "
+            "Defaults to --selection-retriever-candidate-docs when omitted."
+        ),
+    )
+    p.add_argument(
+        "--selection-final-topk-docs",
+        type=int,
+        default=10,
+        help="Final number of docs kept after global rerank in --selection-only mode.",
+    )
+    p.add_argument(
         "--page-summaries-file",
         type=Path,
         default=None,
@@ -1764,6 +1787,121 @@ def _select_selection_only_pages(
     return picked
 
 
+def _final_global_rerank_docs(
+    *,
+    question: str,
+    candidate_rows: list[tuple[str, int, float]],
+    page_summary_map: Optional[dict[str, str]],
+    page_visual_meta_map: Optional[dict[str, dict[str, float | bool]]],
+    final_candidate_doc_limit: int,
+    final_topk_docs: int,
+    use_retriever_agent: bool,
+    retriever_llm_call: Optional[Callable[[str], str]],
+    retriever_prompt_template: Optional[str],
+    visual_boost: float,
+    min_visual_confidence: float,
+) -> tuple[list[tuple[str, int, float]], dict]:
+    if final_topk_docs <= 0 or not candidate_rows:
+        return [], {"enabled": False, "reason": "no-candidates-or-nonpositive-topk"}
+
+    # Keep one best page per doc before final reranking.
+    best_by_doc: dict[str, tuple[str, int, float]] = {}
+    for doc_id, page_idx, score in candidate_rows:
+        doc_id = str(doc_id)
+        row = (doc_id, int(page_idx), float(score))
+        if doc_id not in best_by_doc or float(score) > best_by_doc[doc_id][2]:
+            best_by_doc[doc_id] = row
+
+    descriptor_focused = _is_descriptor_focused_query(question)
+    unique_rows = list(best_by_doc.values())
+    enriched_rows = []
+    any_metadata_signal = False
+    for idx, (doc_id, page_idx, score) in enumerate(unique_rows):
+        combined_score, summary_score, visual_score = _combined_metadata_score(
+            question,
+            _lookup_page_summary(page_summary_map, doc_id, page_idx),
+            _lookup_page_visual_meta(page_visual_meta_map, doc_id, page_idx),
+            descriptor_focused=descriptor_focused,
+            visual_boost=visual_boost,
+            min_confidence=min_visual_confidence,
+        )
+        if combined_score > 0:
+            any_metadata_signal = True
+        enriched_rows.append(
+            (
+                combined_score,
+                summary_score,
+                visual_score,
+                float(score),
+                idx,
+                (doc_id, page_idx, float(score)),
+            )
+        )
+
+    if any_metadata_signal:
+        enriched_rows.sort(key=lambda item: (-item[0], -item[1], -item[3], item[4]))
+    else:
+        enriched_rows.sort(key=lambda item: (-item[3], item[4]))
+
+    pre_llm_rows = [item[5] for item in enriched_rows]
+    candidate_doc_limit = max(int(final_candidate_doc_limit), 1)
+    if candidate_doc_limit < len(pre_llm_rows):
+        pre_llm_rows = pre_llm_rows[:candidate_doc_limit]
+
+    retriever_trace = None
+    reranked_rows = pre_llm_rows
+    if use_retriever_agent and retriever_llm_call is not None and pre_llm_rows:
+        reranked_rows, retriever_trace = _rerank_with_selection_retriever_agent(
+            query=question,
+            retrieved=pre_llm_rows,
+            page_summary_map=page_summary_map,
+            llm_call=retriever_llm_call,
+            candidate_doc_limit=candidate_doc_limit,
+            max_select_docs=max(final_topk_docs, 1),
+            prompt_template=retriever_prompt_template,
+        )
+
+    final_rows: list[tuple[str, int, float]] = []
+    final_seen: set[str] = set()
+    for doc_id, page_idx, score in reranked_rows:
+        doc_id = str(doc_id)
+        if doc_id in final_seen:
+            continue
+        final_seen.add(doc_id)
+        final_rows.append((doc_id, int(page_idx), float(score)))
+        if len(final_rows) >= max(final_topk_docs, 1):
+            break
+
+    trace = {
+        "enabled": True,
+        "candidate_docs_unique": len(unique_rows),
+        "candidate_doc_limit": candidate_doc_limit,
+        "used_retriever_agent": bool(use_retriever_agent and retriever_llm_call is not None),
+        "retriever_agent": retriever_trace,
+        "pre_rerank_top_docs": _top_docs_payload_from_pages(
+            pre_llm_rows,
+            limit=min(20, len(pre_llm_rows)),
+            page_summary_map=page_summary_map,
+            page_visual_meta_map=page_visual_meta_map,
+            query=question,
+            descriptor_focused=descriptor_focused,
+            visual_boost=visual_boost,
+            min_visual_confidence=min_visual_confidence,
+        ),
+        "final_top_docs": _top_docs_payload_from_pages(
+            final_rows,
+            limit=len(final_rows),
+            page_summary_map=page_summary_map,
+            page_visual_meta_map=page_visual_meta_map,
+            query=question,
+            descriptor_focused=descriptor_focused,
+            visual_boost=visual_boost,
+            min_visual_confidence=min_visual_confidence,
+        ),
+    }
+    return final_rows, trace
+
+
 def _top_docs_payload_from_pages(
     rows: list[tuple[str, int, float]],
     limit: int,
@@ -1863,6 +2001,9 @@ def run_selection_only_session(
     selection_retriever_agent: bool = False,
     selection_retriever_candidate_docs: int = 40,
     selection_retriever_select_docs: int = 12,
+    selection_final_global_rerank: bool = False,
+    selection_final_candidate_docs: Optional[int] = None,
+    selection_final_topk_docs: int = 10,
     selection_retriever_llm_call: Optional[Callable[[str], str]] = None,
     selection_retriever_prompt_template: Optional[str] = None,
     selection_answer_conditioned: bool = False,
@@ -1896,6 +2037,18 @@ def run_selection_only_session(
         logger.info("selection-only summary rerank active: {} page summaries loaded", len(page_summary_map))
     if page_visual_meta_map:
         logger.info("selection-only visual metadata active: {} page entries loaded", len(page_visual_meta_map))
+    final_candidate_doc_limit = max(
+        int(selection_final_candidate_docs)
+        if selection_final_candidate_docs is not None
+        else int(selection_retriever_candidate_docs),
+        1,
+    )
+    if selection_final_global_rerank:
+        logger.info(
+            "selection-only final global rerank active: candidate_docs={} topk={}",
+            final_candidate_doc_limit,
+            max(int(selection_final_topk_docs), 1),
+        )
     doc_page_index = _build_doc_page_index(page_summary_map, page_visual_meta_map, set(docid2embs.keys()))
     if selection_summary_full_scan and doc_page_index:
         logger.info(
@@ -1924,6 +2077,7 @@ def run_selection_only_session(
         dynamic_queries = list(planned_queries)
         planner_backfill_queries = []
     intermediate_answers: list[str] = []
+    final_union_candidate_rows: list[tuple[str, int, float]] = []
 
     for turn in range(1, max(selection_max_hop_queries, 1) + 1):
         if turn > len(dynamic_queries):
@@ -1968,6 +2122,8 @@ def run_selection_only_session(
             retrieved_for_selection = metadata_candidates + [x for x in retrieved if x[0] not in seen_doc_ids]
         else:
             retrieved_for_selection = retrieved
+        if selection_final_global_rerank:
+            final_union_candidate_rows.extend(retrieved_for_selection[:final_candidate_doc_limit])
         retriever_agent_trace = None
         if selection_retriever_agent:
             retrieved_for_selection, retriever_agent_trace = _rerank_with_selection_retriever_agent(
@@ -2093,7 +2249,7 @@ def run_selection_only_session(
             final_reason = "no-new-selected-docs"
             break
 
-    return {
+    out = {
         "answer": None,
         "reason": final_reason,
         "steps": steps,
@@ -2120,6 +2276,9 @@ def run_selection_only_session(
                 "selection_retriever_agent": selection_retriever_agent,
                 "selection_retriever_candidate_docs": selection_retriever_candidate_docs,
                 "selection_retriever_select_docs": selection_retriever_select_docs,
+                "selection_final_global_rerank": selection_final_global_rerank,
+                "selection_final_candidate_docs": final_candidate_doc_limit,
+                "selection_final_topk_docs": selection_final_topk_docs,
                 "selection_retriever_prompt_template_used": bool(selection_retriever_prompt_template),
                 "selection_answer_conditioned": selection_answer_conditioned,
                 "selection_answer_context_candidates": selection_answer_context_candidates,
@@ -2128,6 +2287,25 @@ def run_selection_only_session(
                 "selection_visual_min_confidence": selection_visual_min_confidence,
             },
     }
+    if selection_final_global_rerank:
+        final_selected_pages, final_trace = _final_global_rerank_docs(
+            question=question,
+            candidate_rows=final_union_candidate_rows,
+            page_summary_map=page_summary_map,
+            page_visual_meta_map=page_visual_meta_map,
+            final_candidate_doc_limit=final_candidate_doc_limit,
+            final_topk_docs=max(int(selection_final_topk_docs), 1),
+            use_retriever_agent=selection_retriever_agent,
+            retriever_llm_call=selection_retriever_llm_call,
+            retriever_prompt_template=selection_retriever_prompt_template,
+            visual_boost=selection_visual_boost,
+            min_visual_confidence=selection_visual_min_confidence,
+        )
+        out["final_selected_pages"] = final_selected_pages
+        out["final_selected_doc_ids"] = [doc_id for doc_id, _, _ in final_selected_pages]
+        out["final_selected_doc_count"] = len(out["final_selected_doc_ids"])
+        out["final_selection_trace"] = final_trace
+    return out
 
 
 def _pick_column(
@@ -2365,6 +2543,8 @@ def compute_agent_selection_rank_info(agent_payload: dict, gold_doc_ids: list[st
     turns = []
     first_turn_with_gold = None
     all_selected_gold = []
+    all_selected_docs_ordered = []
+    all_selected_docs_seen: set[str] = set()
 
     for step in agent_payload.get("steps", []) or []:
         seen = set()
@@ -2377,6 +2557,9 @@ def compute_agent_selection_rank_info(agent_payload: dict, gold_doc_ids: list[st
                 continue
             seen.add(doc_id)
             selected_doc_ids.append(doc_id)
+            if doc_id not in all_selected_docs_seen:
+                all_selected_docs_seen.add(doc_id)
+                all_selected_docs_ordered.append(doc_id)
 
         selected_gold = [d for d in selected_doc_ids if d in gold_set]
         if selected_gold and first_turn_with_gold is None:
@@ -2393,10 +2576,42 @@ def compute_agent_selection_rank_info(agent_payload: dict, gold_doc_ids: list[st
             }
         )
 
+    final_selected_doc_ids_raw = agent_payload.get("final_selected_doc_ids") or []
+    final_selected_doc_ids: list[str] = []
+    final_seen = set()
+    for doc_id in final_selected_doc_ids_raw:
+        doc_id = str(doc_id)
+        if doc_id in final_seen:
+            continue
+        final_seen.add(doc_id)
+        final_selected_doc_ids.append(doc_id)
+    has_final_selection = bool(final_selected_doc_ids)
+    if not has_final_selection:
+        final_selected_doc_ids = list(all_selected_docs_ordered)
+
+    final_selected_doc_set = set(final_selected_doc_ids)
+    final_selected_gold = [doc_id for doc_id in final_selected_doc_ids if doc_id in gold_set]
+    selected_any_final = bool(final_selected_gold)
+    selected_all_final = bool(gold_set) and all(doc_id in final_selected_doc_set for doc_id in gold_set)
+    selected_any_legacy = selected_any_final if has_final_selection else (first_turn_with_gold is not None)
+    all_selected_gold_set = set(all_selected_gold)
+    selected_all_legacy = selected_all_final if has_final_selection else (
+        bool(gold_set) and all(doc_id in all_selected_gold_set for doc_id in gold_set)
+    )
+
     return {
         "first_turn_with_gold_doc_selected": first_turn_with_gold,
-        "selected_any_gold_doc": first_turn_with_gold is not None,
+        "selected_any_gold_doc": selected_any_legacy,
+        "selected_all_gold_docs": selected_all_legacy,
         "selected_gold_docs_any_turn": all_selected_gold,
+        "selection_has_final_rerank": has_final_selection,
+        "selected_doc_ids_final": final_selected_doc_ids,
+        "selected_total_final": len(final_selected_doc_ids),
+        "selected_doc_ranks_in_doc_pool_final": {d: pos.get(d) for d in final_selected_doc_ids},
+        "selected_gold_docs_final": final_selected_gold,
+        "selected_gold_doc_ranks_in_doc_pool_final": {d: pos.get(d) for d in final_selected_gold},
+        "selected_any_gold_doc_final": selected_any_final,
+        "selected_all_gold_docs_final": selected_all_final,
         "per_turn_doc_selection": turns,
     }
 
@@ -2733,6 +2948,9 @@ def main():
                         selection_retriever_agent=args.selection_retriever_agent,
                         selection_retriever_candidate_docs=args.selection_retriever_candidate_docs,
                         selection_retriever_select_docs=args.selection_retriever_select_docs,
+                        selection_final_global_rerank=args.selection_final_global_rerank,
+                        selection_final_candidate_docs=args.selection_final_candidate_docs,
+                        selection_final_topk_docs=args.selection_final_topk_docs,
                         selection_retriever_llm_call=selection_retriever_llm_call,
                         selection_retriever_prompt_template=selection_retriever_prompt_template,
                         selection_answer_conditioned=args.selection_answer_conditioned,
@@ -2844,6 +3062,9 @@ def main():
             "selection_retriever_agent": args.selection_retriever_agent,
             "selection_retriever_candidate_docs": args.selection_retriever_candidate_docs,
             "selection_retriever_select_docs": args.selection_retriever_select_docs,
+            "selection_final_global_rerank": args.selection_final_global_rerank,
+            "selection_final_candidate_docs": args.selection_final_candidate_docs,
+            "selection_final_topk_docs": args.selection_final_topk_docs,
             "selection_retriever_prompt_file": (
                 str(args.selection_retriever_prompt_file) if args.selection_retriever_prompt_file else None
             ),
