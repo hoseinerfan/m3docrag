@@ -1217,6 +1217,25 @@ def _parse_selection_retriever_response(
             if len(picked) >= max(max_select_docs, 1):
                 return picked
 
+    # Fallback: parse candidate indices from partially formed text/JSON.
+    # This handles truncated responses like: {"selected":[{"candidate_index":4
+    candidate_indices = re.findall(r"candidate_index\"?\s*[:=]\s*(\d+)", raw_reply, flags=re.IGNORECASE)
+    for idx_str in candidate_indices:
+        try:
+            idx = int(idx_str)
+        except Exception:
+            continue
+        row = candidate_by_index.get(idx)
+        if row is None:
+            continue
+        uid = f"{row[0]}#p{int(row[1])}"
+        if uid in picked_uids:
+            continue
+        picked.append(row)
+        picked_uids.add(uid)
+        if len(picked) >= max(max_select_docs, 1):
+            return picked
+
     # Fallback: parse doc IDs in raw text.
     doc_ids = re.findall(r"\b[0-9a-f]{32}\b", raw_reply.casefold())
     for doc_id in doc_ids:
