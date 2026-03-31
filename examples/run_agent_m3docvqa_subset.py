@@ -968,6 +968,36 @@ def _selection_retriever_prompt(
     )
 
 
+def _selection_retriever_repair_prompt(
+    *,
+    question: str,
+    candidates: list[dict],
+) -> str:
+    lines = []
+    for row in candidates:
+        lines.append(
+            f"[{row['candidate_index']}] doc_id={row['doc_id']} page_idx={row['page_idx']} "
+            f"retrieval_score={row['score']:.4f}"
+        )
+    joined_candidates = "\n".join(lines)
+    return (
+        "Your previous RetrieverAgent response was invalid because it selected zero candidates.\n"
+        "Select exactly 1 candidate that is most likely to contain evidence for the query.\n\n"
+        f"QUERY:\n{question}\n\n"
+        "CANDIDATES:\n"
+        f"{joined_candidates}\n\n"
+        "Return JSON only with this exact schema:\n"
+        "{\n"
+        '  "selected": [\n'
+        '    {"candidate_index": 1}\n'
+        "  ]\n"
+        "}\n"
+        "Rules:\n"
+        "- candidate_index must be from the list above.\n"
+        "- no markdown, no explanation.\n"
+    )
+
+
 def _selection_answer_conditioned_prompt(
     *,
     question: str,
@@ -1270,6 +1300,9 @@ def _rerank_with_selection_retriever_agent(
         "parse_success": False,
         "selected_docs": [],
         "raw_reply_preview": None,
+        "repair_attempted": False,
+        "repair_success": False,
+        "repair_reply_preview": None,
         "error": None,
     }
     if not retrieved or llm_call is None:
@@ -1327,12 +1360,33 @@ def _rerank_with_selection_retriever_agent(
     )
     if not selected_rows:
         if require_success:
-            preview = trace.get("raw_reply_preview") or ""
-            raise RuntimeError(
-                "RetrieverAgent response parse failed. "
-                f"Preview={preview[:200]!r}"
+            trace["repair_attempted"] = True
+            repair_prompt = _selection_retriever_repair_prompt(
+                question=query,
+                candidates=candidate_payload,
             )
-        return retrieved, trace
+            try:
+                repair_reply = llm_call(repair_prompt) or ""
+                trace["repair_reply_preview"] = _norm_text(repair_reply)[:400]
+                selected_rows = _parse_selection_retriever_response(
+                    raw_reply=repair_reply,
+                    candidate_rows=candidate_rows,
+                    max_select_docs=1,
+                )
+            except Exception as exc:
+                trace["error"] = f"repair_call_failed: {exc}"
+                raise RuntimeError(f"RetrieverAgent repair call failed: {exc}") from exc
+
+            if not selected_rows:
+                preview = trace.get("raw_reply_preview") or ""
+                repair_preview = trace.get("repair_reply_preview") or ""
+                raise RuntimeError(
+                    "RetrieverAgent response parse failed after repair. "
+                    f"Preview={preview[:200]!r} RepairPreview={repair_preview[:200]!r}"
+                )
+            trace["repair_success"] = True
+        else:
+            return retrieved, trace
 
     trace["parse_success"] = True
     trace["selected_count"] = len(selected_rows)
