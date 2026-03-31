@@ -451,6 +451,20 @@ def make_llm_call_openai_api(
                     raw = resp.read().decode("utf-8")
                 obj = json.loads(raw)
                 return str(((obj.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+            except urlerror.HTTPError as exc:
+                try:
+                    err_body = exc.read().decode("utf-8", errors="ignore")
+                except Exception:
+                    err_body = str(exc)
+                prompt_chars = len(str(prompt))
+                msg = (
+                    f"HTTP {exc.code} from policy endpoint. "
+                    f"prompt_chars={prompt_chars} max_tokens={int(max_tokens)} "
+                    f"response={_norm_text(err_body)[:500]}"
+                )
+                last_err = RuntimeError(msg)
+                if attempt < attempts:
+                    time.sleep(0.6 * attempt)
             except (urlerror.URLError, TimeoutError, OSError, json.JSONDecodeError, KeyError, ValueError) as exc:
                 last_err = exc
                 if attempt < attempts:
