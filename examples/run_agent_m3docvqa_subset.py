@@ -1378,6 +1378,7 @@ def _rerank_with_selection_retriever_agent(
     if len(selected_rows) < min_required:
         if require_success:
             trace["repair_attempted"] = True
+
             def _merge_rows(
                 base: list[tuple[str, int, float]],
                 extra: list[tuple[str, int, float]],
@@ -1395,23 +1396,50 @@ def _rerank_with_selection_retriever_agent(
                         break
                 return merged
 
-            repair_attempts = 3
+            def _build_candidate_payload(
+                rows: list[tuple[str, int, float]],
+            ) -> list[dict]:
+                payload: list[dict] = []
+                for idx, (doc_id, page_idx, score) in enumerate(rows, start=1):
+                    summary_text = _lookup_page_summary(page_summary_map, str(doc_id), int(page_idx)) or ""
+                    payload.append(
+                        {
+                            "candidate_index": idx,
+                            "doc_id": str(doc_id),
+                            "page_idx": int(page_idx),
+                            "score": float(score),
+                            "summary": summary_text,
+                        }
+                    )
+                return payload
+
+            repair_attempts = max(3, min_required * 2)
             for _ in range(repair_attempts):
                 need = max(min_required - len(selected_rows), 0)
                 if need <= 0:
                     break
+
+                selected_uids = {f"{doc_id}#p{int(page_idx)}" for doc_id, page_idx, _ in selected_rows}
+                remaining_rows = [
+                    row for row in candidate_rows if f"{row[0]}#p{int(row[1])}" not in selected_uids
+                ]
+                if not remaining_rows:
+                    break
+
+                ask_count = min(max(need, 1), len(remaining_rows))
+                repair_candidates = _build_candidate_payload(remaining_rows)
                 repair_prompt = _selection_retriever_repair_prompt(
                     question=query,
-                    candidates=candidate_payload,
-                    required_count=need,
+                    candidates=repair_candidates,
+                    required_count=ask_count,
                 )
                 try:
                     repair_reply = llm_call(repair_prompt) or ""
                     trace["repair_reply_preview"] = _norm_text(repair_reply)[:400]
                     repair_rows = _parse_selection_retriever_response(
                         raw_reply=repair_reply,
-                        candidate_rows=candidate_rows,
-                        max_select_docs=max(need, 1),
+                        candidate_rows=remaining_rows,
+                        max_select_docs=ask_count,
                     )
                     selected_rows = _merge_rows(selected_rows, repair_rows, target_count)
                 except Exception as exc:
@@ -1422,7 +1450,8 @@ def _rerank_with_selection_retriever_agent(
                 preview = trace.get("raw_reply_preview") or ""
                 repair_preview = trace.get("repair_reply_preview") or ""
                 raise RuntimeError(
-                    "RetrieverAgent response parse failed after repair. "
+                    "RetrieverAgent selected too few candidates after repair. "
+                    f"selected={len(selected_rows)} required={min_required} "
                     f"Preview={preview[:200]!r} RepairPreview={repair_preview[:200]!r}"
                 )
             trace["repair_success"] = True
