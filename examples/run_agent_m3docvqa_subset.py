@@ -1222,6 +1222,19 @@ def _parse_selection_retriever_response(
     picked: list[tuple[str, int, float]] = []
     picked_uids: set[str] = set()
 
+    def _pick_by_index_list(indices: list[int]) -> None:
+        for idx in indices:
+            row = candidate_by_index.get(int(idx))
+            if row is None:
+                continue
+            uid = f"{row[0]}#p{int(row[1])}"
+            if uid in picked_uids:
+                continue
+            picked.append(row)
+            picked_uids.add(uid)
+            if len(picked) >= max(max_select_docs, 1):
+                break
+
     payload = _extract_first_json_object(raw_reply)
     selected_items = None
     if isinstance(payload, dict):
@@ -1259,24 +1272,22 @@ def _parse_selection_retriever_response(
             if len(picked) >= max(max_select_docs, 1):
                 return picked
 
+    # Fallback: parse truncated integer lists like:
+    # {"selected":[1,2,3,4
+    if len(picked) < max(max_select_docs, 1):
+        m_selected = re.search(r'"selected"\s*:\s*\[([^\]]*)', raw_reply, flags=re.IGNORECASE | re.DOTALL)
+        if m_selected:
+            idx_list = [int(x) for x in re.findall(r"\b\d+\b", m_selected.group(1))]
+            _pick_by_index_list(idx_list)
+            if len(picked) >= max(max_select_docs, 1):
+                return picked
+
     # Fallback: parse candidate indices from partially formed text/JSON.
     # This handles truncated responses like: {"selected":[{"candidate_index":4
     candidate_indices = re.findall(r"candidate_index\"?\s*[:=]\s*(\d+)", raw_reply, flags=re.IGNORECASE)
-    for idx_str in candidate_indices:
-        try:
-            idx = int(idx_str)
-        except Exception:
-            continue
-        row = candidate_by_index.get(idx)
-        if row is None:
-            continue
-        uid = f"{row[0]}#p{int(row[1])}"
-        if uid in picked_uids:
-            continue
-        picked.append(row)
-        picked_uids.add(uid)
-        if len(picked) >= max(max_select_docs, 1):
-            return picked
+    _pick_by_index_list([int(x) for x in candidate_indices])
+    if len(picked) >= max(max_select_docs, 1):
+        return picked
 
     # Fallback: parse doc IDs in raw text.
     doc_ids = re.findall(r"\b[0-9a-f]{32}\b", raw_reply.casefold())
@@ -1353,6 +1364,20 @@ def _rerank_with_selection_retriever_agent(
     target_count = min(max(int(max_select_docs), 1), len(candidate_rows))
     min_required = target_count if require_exact_count else 1
     trace["required_selection_count"] = min_required
+
+    # If caller asks to keep all candidate rows, skip the LLM call.
+    if target_count >= len(candidate_rows):
+        trace["parse_success"] = True
+        trace["selected_count"] = len(candidate_rows)
+        trace["selected_docs"] = [
+            {"doc_id": str(doc_id), "page_idx": int(page_idx)}
+            for doc_id, page_idx, _ in candidate_rows
+        ]
+        selected_uids = {f"{doc_id}#p{int(page_idx)}" for doc_id, page_idx, _ in candidate_rows}
+        remainder = [
+            row for row in retrieved if f"{str(row[0])}#p{int(row[1])}" not in selected_uids
+        ]
+        return candidate_rows + remainder, trace
 
     prompt = _selection_retriever_prompt(
         question=query,
