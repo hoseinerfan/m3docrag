@@ -2132,7 +2132,8 @@ def _final_global_rerank_docs(
             retrieved=stage_rows,
             page_summary_map=page_summary_map,
             llm_call=retriever_llm_call,
-            candidate_doc_limit=min(len(stage_rows), chunk_size),
+            # Final stage should consider the whole surviving pool; do not cap by chunk size.
+            candidate_doc_limit=len(stage_rows),
             max_select_docs=topk_target,
             require_success=retriever_require_success,
             require_exact_count=retriever_require_success,
