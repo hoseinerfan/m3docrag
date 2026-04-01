@@ -931,11 +931,21 @@ def _selection_retriever_prompt(
     prompt_template: Optional[str] = None,
 ) -> str:
     lines = []
+    # Keep prompts compact for 1k-token context windows.
+    n_candidates = max(len(candidates), 1)
+    if n_candidates >= 8:
+        summary_char_cap = 60
+    elif n_candidates >= 6:
+        summary_char_cap = 80
+    elif n_candidates >= 4:
+        summary_char_cap = 110
+    else:
+        summary_char_cap = 160
     for row in candidates:
-        summary = _norm_text(str(row.get("summary") or ""))[:220]
+        summary = _norm_text(str(row.get("summary") or ""))[:summary_char_cap]
         lines.append(
-            f"[{row['candidate_index']}] doc_id={row['doc_id']} page_idx={row['page_idx']} "
-            f"retrieval_score={row['score']:.4f} summary={summary}"
+            f"[{row['candidate_index']}] d={row['doc_id']} p={row['page_idx']} "
+            f"s={row['score']:.2f} t={summary}"
         )
     joined_candidates = "\n".join(lines)
     rendered = _render_prompt_template(
