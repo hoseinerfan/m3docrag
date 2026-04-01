@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import time
 from pathlib import Path
@@ -982,28 +983,29 @@ def _selection_retriever_repair_prompt(
     *,
     question: str,
     candidates: list[dict],
+    required_count: int,
 ) -> str:
     lines = []
     for row in candidates:
         lines.append(
-            f"[{row['candidate_index']}] doc_id={row['doc_id']} page_idx={row['page_idx']} "
-            f"retrieval_score={row['score']:.4f}"
+            f"[{row['candidate_index']}] d={row['doc_id']} p={row['page_idx']} s={row['score']:.2f}"
         )
     joined_candidates = "\n".join(lines)
     return (
-        "Your previous RetrieverAgent response was invalid because it selected zero candidates.\n"
-        "Select exactly 1 candidate that is most likely to contain evidence for the query.\n\n"
+        "Your previous RetrieverAgent response was invalid.\n"
+        f"Select exactly {max(int(required_count), 1)} candidates for the query.\n\n"
         f"QUERY:\n{question}\n\n"
         "CANDIDATES:\n"
         f"{joined_candidates}\n\n"
         "Return JSON only with this exact schema:\n"
         "{\n"
         '  "selected": [\n'
-        '    {"candidate_index": 1}\n'
+        "    1\n"
         "  ]\n"
         "}\n"
         "Rules:\n"
         "- candidate_index must be from the list above.\n"
+        f"- return exactly {max(int(required_count), 1)} indices.\n"
         "- no markdown, no explanation.\n"
     )
 
@@ -1301,6 +1303,7 @@ def _rerank_with_selection_retriever_agent(
     candidate_doc_limit: int,
     max_select_docs: int,
     require_success: bool = False,
+    require_exact_count: bool = False,
     prompt_template: Optional[str] = None,
 ) -> tuple[list[tuple[str, int, float]], dict]:
     trace = {
@@ -1313,6 +1316,7 @@ def _rerank_with_selection_retriever_agent(
         "repair_attempted": False,
         "repair_success": False,
         "repair_reply_preview": None,
+        "required_selection_count": None,
         "error": None,
     }
     if not retrieved or llm_call is None:
@@ -1346,11 +1350,14 @@ def _rerank_with_selection_retriever_agent(
     trace["candidate_docs_considered"] = len(candidate_rows)
     if not candidate_rows:
         return retrieved, trace
+    target_count = min(max(int(max_select_docs), 1), len(candidate_rows))
+    min_required = target_count if require_exact_count else 1
+    trace["required_selection_count"] = min_required
 
     prompt = _selection_retriever_prompt(
         question=query,
         candidates=candidate_payload,
-        max_select_docs=max_select_docs,
+        max_select_docs=target_count,
         prompt_template=prompt_template,
     )
     try:
@@ -1366,28 +1373,52 @@ def _rerank_with_selection_retriever_agent(
     selected_rows = _parse_selection_retriever_response(
         raw_reply=raw_reply,
         candidate_rows=candidate_rows,
-        max_select_docs=max_select_docs,
+        max_select_docs=target_count,
     )
-    if not selected_rows:
+    if len(selected_rows) < min_required:
         if require_success:
             trace["repair_attempted"] = True
-            repair_prompt = _selection_retriever_repair_prompt(
-                question=query,
-                candidates=candidate_payload,
-            )
-            try:
-                repair_reply = llm_call(repair_prompt) or ""
-                trace["repair_reply_preview"] = _norm_text(repair_reply)[:400]
-                selected_rows = _parse_selection_retriever_response(
-                    raw_reply=repair_reply,
-                    candidate_rows=candidate_rows,
-                    max_select_docs=1,
-                )
-            except Exception as exc:
-                trace["error"] = f"repair_call_failed: {exc}"
-                raise RuntimeError(f"RetrieverAgent repair call failed: {exc}") from exc
+            def _merge_rows(
+                base: list[tuple[str, int, float]],
+                extra: list[tuple[str, int, float]],
+                limit: int,
+            ) -> list[tuple[str, int, float]]:
+                merged: list[tuple[str, int, float]] = []
+                seen: set[str] = set()
+                for row in list(base) + list(extra):
+                    uid = f"{row[0]}#p{int(row[1])}"
+                    if uid in seen:
+                        continue
+                    seen.add(uid)
+                    merged.append(row)
+                    if len(merged) >= max(limit, 1):
+                        break
+                return merged
 
-            if not selected_rows:
+            repair_attempts = 3
+            for _ in range(repair_attempts):
+                need = max(min_required - len(selected_rows), 0)
+                if need <= 0:
+                    break
+                repair_prompt = _selection_retriever_repair_prompt(
+                    question=query,
+                    candidates=candidate_payload,
+                    required_count=need,
+                )
+                try:
+                    repair_reply = llm_call(repair_prompt) or ""
+                    trace["repair_reply_preview"] = _norm_text(repair_reply)[:400]
+                    repair_rows = _parse_selection_retriever_response(
+                        raw_reply=repair_reply,
+                        candidate_rows=candidate_rows,
+                        max_select_docs=max(need, 1),
+                    )
+                    selected_rows = _merge_rows(selected_rows, repair_rows, target_count)
+                except Exception as exc:
+                    trace["error"] = f"repair_call_failed: {exc}"
+                    raise RuntimeError(f"RetrieverAgent repair call failed: {exc}") from exc
+
+            if len(selected_rows) < min_required:
                 preview = trace.get("raw_reply_preview") or ""
                 repair_preview = trace.get("repair_reply_preview") or ""
                 raise RuntimeError(
@@ -1990,11 +2021,12 @@ def _final_global_rerank_docs(
     if use_retriever_agent and retriever_llm_call is not None and pre_llm_rows:
         chunk_size = max(int(rerank_chunk_size), 1)
         chunk_keep = max(int(rerank_chunk_keep), 1)
+        topk_target = max(int(final_topk_docs), 1)
         stage_rows = list(pre_llm_rows)
         round_idx = 1
 
         # Tournament rerank: process large candidate sets in chunks to avoid prompt overflows.
-        while len(stage_rows) > chunk_size:
+        while len(stage_rows) > max(chunk_size, topk_target):
             chunks = [stage_rows[i : i + chunk_size] for i in range(0, len(stage_rows), chunk_size)]
             next_stage: list[tuple[str, int, float]] = []
             round_rows_before = len(stage_rows)
@@ -2004,8 +2036,9 @@ def _final_global_rerank_docs(
                 "num_chunks": len(chunks),
                 "chunk_results": [],
             }
+            min_keep_needed = max(1, math.ceil(topk_target / max(len(chunks), 1)))
             for chunk_idx, chunk in enumerate(chunks, start=1):
-                select_k = min(chunk_keep, len(chunk))
+                select_k = min(len(chunk), max(chunk_keep, min_keep_needed))
                 chunk_reranked, chunk_trace = _rerank_with_selection_retriever_agent(
                     query=question,
                     retrieved=chunk,
@@ -2014,6 +2047,7 @@ def _final_global_rerank_docs(
                     candidate_doc_limit=len(chunk),
                     max_select_docs=select_k,
                     require_success=retriever_require_success,
+                    require_exact_count=retriever_require_success,
                     prompt_template=retriever_prompt_template,
                 )
                 picked_chunk: list[tuple[str, int, float]] = []
@@ -2047,11 +2081,22 @@ def _final_global_rerank_docs(
             stage_rows = dedup_stage
             round_info["rows_after"] = len(stage_rows)
             tournament_trace["rounds"].append(round_info)
+            if retriever_require_success and len(stage_rows) < topk_target:
+                raise RuntimeError(
+                    "Final tournament candidate set dropped below final_topk_docs. "
+                    f"rows_after={len(stage_rows)} final_topk_docs={topk_target}"
+                )
             round_idx += 1
             if round_idx > 10:
                 if retriever_require_success:
                     raise RuntimeError("Final global rerank exceeded max tournament rounds (10).")
                 break
+
+        if retriever_require_success and len(stage_rows) < topk_target:
+            raise RuntimeError(
+                "Final rerank candidate set is smaller than final_topk_docs. "
+                f"candidate_rows={len(stage_rows)} final_topk_docs={topk_target}"
+            )
 
         reranked_rows, retriever_trace = _rerank_with_selection_retriever_agent(
             query=question,
@@ -2059,8 +2104,9 @@ def _final_global_rerank_docs(
             page_summary_map=page_summary_map,
             llm_call=retriever_llm_call,
             candidate_doc_limit=min(len(stage_rows), chunk_size),
-            max_select_docs=max(final_topk_docs, 1),
+            max_select_docs=topk_target,
             require_success=retriever_require_success,
+            require_exact_count=retriever_require_success,
             prompt_template=retriever_prompt_template,
         )
 
