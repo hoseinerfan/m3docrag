@@ -15,6 +15,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from PIL import Image
+import os
 import requests
 import torch
 from torchvision import io
@@ -62,6 +63,7 @@ def generate(
     question,
     images
 ) -> List[str]:
+    debug_qwen2 = os.environ.get("M3DOCRAG_DEBUG_QWEN2", "0") == "1"
 
     image_content = [{"type": "image", "image": "dummy_content"}] * len(images)
 
@@ -84,13 +86,35 @@ def generate(
     )
 
     p = next(iter(model.parameters()))
+    model_inputs = {}
+    for key, value in inputs.items():
+        if not torch.is_tensor(value):
+            model_inputs[key] = value
+            continue
+        if key == "image_grid_thw":
+            # Keep image_grid_thw on CPU to avoid CUDA invalid-argument failures in prod().
+            model_inputs[key] = value.to("cpu", dtype=torch.int64)
+        else:
+            model_inputs[key] = value.to(p.device)
 
-    inputs = inputs.to(p.device)
+    if debug_qwen2:
+        print(f"[qwen2-debug] question={question!r}", flush=True)
+        for key, value in model_inputs.items():
+            if torch.is_tensor(value):
+                msg = (
+                    f"[qwen2-debug] {key}: shape={tuple(value.shape)} "
+                    f"dtype={value.dtype} device={value.device}"
+                )
+                if key == "image_grid_thw" and value.numel() > 0:
+                    msg += f" values={value.reshape(-1).tolist()[:12]}"
+                print(msg, flush=True)
+            else:
+                print(f"[qwen2-debug] {key}: type={type(value).__name__}", flush=True)
 
     # Inference
-    generated_ids = model.generate(**inputs, max_new_tokens=128, do_sample=False)
+    generated_ids = model.generate(**model_inputs, max_new_tokens=128, do_sample=False)
     generated_ids_trimmed = [
-        out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        out_ids[len(in_ids) :] for in_ids, out_ids in zip(model_inputs["input_ids"], generated_ids)
     ]
     output_text = processor.batch_decode(
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
