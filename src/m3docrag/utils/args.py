@@ -16,6 +16,7 @@
 
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence, List
+import re
 import transformers
 from icecream import ic
 
@@ -91,7 +92,25 @@ _example_args = _example_arg_str.strip().split('\n')
 
 
 def parse_args(args=None):
-    parser = transformers.HfArgumentParser(TrainingArguments)
+    parser = None
+    # Some transformers builds expose TrainingArguments forward-ref type names
+    # that are absent from this module namespace (e.g., ParallelismConfig).
+    # Resolve them lazily so HfArgumentParser can initialize.
+    for _ in range(8):
+        try:
+            parser = transformers.HfArgumentParser(TrainingArguments)
+            break
+        except RuntimeError as exc:
+            m = re.search(r"name '([^']+)' is not defined", str(exc))
+            if not m:
+                raise
+            missing = m.group(1)
+            if missing in globals():
+                raise
+            globals()[missing] = str
+    if parser is None:
+        raise RuntimeError("Failed to initialize HfArgumentParser for TrainingArguments.")
+
     parsed_args, remaining_args = parser.parse_args_into_dataclasses(args, return_remaining_strings=True)
     ic(remaining_args)
 
