@@ -46,6 +46,10 @@ class TrainingArguments(transformers.TrainingArguments):
 
     # Embedding indexing settings
     faiss_index_type: str = field(default='ivfflat', metadata={"choices": ['flatip', 'ivfflat', 'ivfpq']})
+    faiss_index_dir: str = field(
+        default=None,
+        metadata={"help": "Absolute path to FAISS index directory containing index.bin; overrides embedding_name+faiss_index_type"},
+    )
 
 
     # Local paths
