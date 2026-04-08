@@ -16,6 +16,7 @@
 
 import datetime
 import json
+import os
 import time
 from pathlib import Path
 
@@ -351,6 +352,14 @@ def main():
         import faiss
 
         index = faiss.read_index(str(local_index_dir / "index.bin"))
+        ivf = faiss.extract_index_ivf(index)
+        if ivf is not None:
+            # Improve IVF recall versus the default nprobe=1.
+            # Allow override with env var FAISS_NPROBE.
+            requested_nprobe = int(os.getenv("FAISS_NPROBE", "64"))
+            requested_nprobe = max(1, requested_nprobe)
+            ivf.nprobe = min(requested_nprobe, int(ivf.nlist))
+            logger.info(f"Configured FAISS IVF nprobe={ivf.nprobe} (nlist={ivf.nlist})")
         logger.info("Loading faiss index -- done")
 
     def list_collate_fn(batch):
