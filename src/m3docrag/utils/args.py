@@ -40,10 +40,6 @@ class TrainingArguments(transformers.TrainingArguments):
     retrieval_only: bool = field(default=False, metadata={"help": "not running stage 2 (VQA)"})
     page_retrieval_type: str = 'logits'
     loop_unique_doc_ids: bool = field(default=False, metadata={"help": "if true, apply retrieval only on unique doc ids"})
-    single_page_from_each_doc: bool = field(
-        default=False,
-        metadata={"help": "If true, return at most one page per document in retrieval results"},
-    )
 
     n_retrieval_pages: int = 1
 
@@ -57,14 +53,6 @@ class TrainingArguments(transformers.TrainingArguments):
     faiss_nprobe: int = field(
         default=1,
         metadata={"help": "FAISS IVF nprobe at search time (ignored for non-IVF indexes)"},
-    )
-    faiss_token_topk: int = field(
-        default=0,
-        metadata={"help": "Per-query-token ANN top-k before page aggregation (0 uses n_retrieval_pages)"},
-    )
-    faiss_exact_rerank_pages: int = field(
-        default=0,
-        metadata={"help": "If >0, exact ColPali rerank this many top aggregated pages before final top-k"},
     )
 
 
