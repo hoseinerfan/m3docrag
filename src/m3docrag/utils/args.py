@@ -66,10 +66,6 @@ class TrainingArguments(transformers.TrainingArguments):
         default=0,
         metadata={"help": "If >0, exact ColPali rerank this many top aggregated pages before final top-k"},
     )
-    retrieval_exact_fullscan: bool = field(
-        default=False,
-        metadata={"help": "If true, skip FAISS and score all pages exactly with ColPali MaxSim"},
-    )
 
 
     # Local paths

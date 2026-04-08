@@ -256,8 +256,6 @@ def main():
             / f"{args.embedding_name}_pageindex_{args.faiss_index_type}"
         )
     logger.info(f"Using FAISS index dir: {local_index_dir}")
-    if args.retrieval_exact_fullscan:
-        logger.info("retrieval_exact_fullscan=True: FAISS will be skipped")
     # local_answer_extraction_model_dir =  Path(LOCAL_MODEL_DIR) / args.answer_extraction_model_name_or_path
 
     if is_distributed():
@@ -290,7 +288,7 @@ def main():
                     f"Retrieval adapter model directory {local_retrieval_adapter_model_dir} does not exist"
                 )
 
-        if not args.retrieval_exact_fullscan and not local_index_dir.exists():
+        if not local_index_dir.exists():
             raise ValueError(
                 f"Index directory {local_index_dir} does not exist"
             )
@@ -374,7 +372,7 @@ def main():
     logger.info("loaded dataset")
 
     index = None
-    if not args.retrieval_exact_fullscan and local_index_dir.exists():
+    if local_index_dir.exists():
         logger.info("Loading faiss index")
         import faiss
 
@@ -431,11 +429,10 @@ def main():
         ret_name = args.retrieval_model_name_or_path
 
     index_tag = Path(args.faiss_index_dir).name if args.faiss_index_dir else args.faiss_index_type
-    retrieval_mode_tag = "fullscan" if args.retrieval_exact_fullscan else index_tag
     if args.retrieval_only:
-        pred_save_fname = f"{ret_name}_{retrieval_mode_tag}_ret{args.n_retrieval_pages}_{experiment_date}.json"
+        pred_save_fname = f"{ret_name}_{index_tag}_ret{args.n_retrieval_pages}_{experiment_date}.json"
     else:
-        pred_save_fname = f"{ret_name}_{retrieval_mode_tag}_ret{args.n_retrieval_pages}_{args.model_name_or_path}_{experiment_date}.json"
+        pred_save_fname = f"{ret_name}_{index_tag}_ret{args.n_retrieval_pages}_{args.model_name_or_path}_{experiment_date}.json"
     results_file = save_dir / pred_save_fname
     with open(results_file, "w") as f:
         json.dump(samples, f, indent=4)
@@ -451,9 +448,9 @@ def main():
             dataset.mmqa_data_path,  # '/job/datasets/m3-docvqa/MMQA_dev.jsonl'
         )
         if args.retrieval_only:
-            eval_save_fname = f"{ret_name}_{retrieval_mode_tag}_ret{args.n_retrieval_pages}_{experiment_date}_eval_results.json"
+            eval_save_fname = f"{ret_name}_{index_tag}_ret{args.n_retrieval_pages}_{experiment_date}_eval_results.json"
         else:
-            eval_save_fname = f"{ret_name}_{retrieval_mode_tag}_ret{args.n_retrieval_pages}_{args.model_name_or_path}_{experiment_date}_eval_results.json"
+            eval_save_fname = f"{ret_name}_{index_tag}_ret{args.n_retrieval_pages}_{args.model_name_or_path}_{experiment_date}_eval_results.json"
         results_file = save_dir / eval_save_fname
         with open(results_file, "w") as f:
             json.dump(all_eval_scores, f, indent=4)
