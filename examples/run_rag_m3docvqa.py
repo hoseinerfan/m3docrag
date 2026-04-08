@@ -425,20 +425,23 @@ def main():
 
     logger.info(f"Prediction results saved at: {results_file}")
 
-    # Evaluation
-    all_eval_scores = evaluate_prediction_file(
-        samples,
-        dataset.mmqa_data_path,  # '/job/datasets/m3-docvqa/MMQA_dev.jsonl'
-    )
-    if args.retrieval_only:
-        eval_save_fname = f"{ret_name}_{args.faiss_index_type}_ret{args.n_retrieval_pages}_{experiment_date}_eval_results.json"
+    if args.skip_eval:
+        logger.info("Skipping evaluation because --skip_eval=True")
     else:
-        eval_save_fname = f"{ret_name}_{args.faiss_index_type}_ret{args.n_retrieval_pages}_{args.model_name_or_path}_{experiment_date}_eval_results.json"
-    results_file = save_dir / eval_save_fname
-    with open(results_file, "w") as f:
-        json.dump(all_eval_scores, f, indent=4)
+        # Evaluation
+        all_eval_scores = evaluate_prediction_file(
+            samples,
+            dataset.mmqa_data_path,  # '/job/datasets/m3-docvqa/MMQA_dev.jsonl'
+        )
+        if args.retrieval_only:
+            eval_save_fname = f"{ret_name}_{args.faiss_index_type}_ret{args.n_retrieval_pages}_{experiment_date}_eval_results.json"
+        else:
+            eval_save_fname = f"{ret_name}_{args.faiss_index_type}_ret{args.n_retrieval_pages}_{args.model_name_or_path}_{experiment_date}_eval_results.json"
+        results_file = save_dir / eval_save_fname
+        with open(results_file, "w") as f:
+            json.dump(all_eval_scores, f, indent=4)
 
-    logger.info(f"Evaluation results saved at: {results_file}")
+        logger.info(f"Evaluation results saved at: {results_file}")
 
     if is_distributed():
         barrier()

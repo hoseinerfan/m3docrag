@@ -26,6 +26,7 @@ class TrainingArguments(transformers.TrainingArguments):
     split: str = 'train'
     data_name: str = field(default='m3-docvqa', metadata={"help": "Local name to be stored at LOCAL_DATA_DIR"})
     data_len: int = field(default=None, metadata={"help": "number of examples to subsample from dataset"})
+    target_qid: str = field(default=None, metadata={"help": "Run only a single MMQA question id"})
     use_dummy_images: bool = field(default=False, metadata={"help": "if true, skip downloading images"})
     load_embedding: bool = False
     embedding_name: str = "colpali-v1.2_m3-docvqa_dev"
@@ -54,6 +55,7 @@ class TrainingArguments(transformers.TrainingArguments):
 
     # Model settings
     bits: int = field(default=16, metadata={"help": "Floating point precision. Use '4' for 4-bit quantization to save memory"})
+    skip_eval: bool = field(default=False, metadata={"help": "Skip final full-split evaluation pass"})
 
     # idefics2 settings
     do_image_splitting: bool = False

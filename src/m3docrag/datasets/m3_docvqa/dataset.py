@@ -50,6 +50,14 @@ class M3DocVQADataset(torch.utils.data.Dataset):
         with jsonlines.open(mmqa_data_path) as reader:
             for i, obj in enumerate(reader):
                 data.append(obj)
+
+        if getattr(args, "target_qid", None):
+            target_qid = str(args.target_qid)
+            data = [obj for obj in data if str(obj.get("qid", "")) == target_qid]
+            if not data:
+                raise ValueError(f"target_qid not found in split {args.split}: {target_qid}")
+            logger.info(f"Filtered dataset to target_qid={target_qid}")
+
         logger.info(f"# Data {len(data)}")
         self.data = data
 
