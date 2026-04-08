@@ -19,6 +19,29 @@ from typing import Dict, Optional, Sequence, List
 import transformers
 from icecream import ic
 
+# Compatibility shim for newer transformers versions where HfArgumentParser
+# resolves forward refs from TrainingArguments in this module's namespace.
+try:  # pragma: no cover
+    import transformers.training_args as _ta
+
+    for _name in (
+        "ParallelismConfig",
+        "AcceleratorConfig",
+        "EvaluationStrategy",
+        "FSDPOption",
+        "HubStrategy",
+        "IntervalStrategy",
+        "SchedulerType",
+        "OptimizerNames",
+        "DebugOption",
+        "ShardedDDPOption",
+        "ParallelMode",
+    ):
+        if _name not in globals() and hasattr(_ta, _name):
+            globals()[_name] = getattr(_ta, _name)
+except Exception:
+    pass
+
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
 
