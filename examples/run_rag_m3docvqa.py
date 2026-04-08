@@ -15,11 +15,13 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import datetime
+import hashlib
 import json
 import time
 from pathlib import Path
 
 import accelerate
+import numpy as np
 import pytz
 import torch
 import transformers
@@ -49,6 +51,91 @@ from m3docrag.utils.paths import (
 from m3docrag.utils.prompts import short_answer_template
 from m3docrag.utils.tar import extract_tarfile
 from m3docrag.vqa import VQAModel
+
+
+def _get_doc_ids_signature(doc_ids: list[str]) -> str:
+    hasher = hashlib.sha1()
+    for doc_id in doc_ids:
+        hasher.update(str(doc_id).encode("utf-8"))
+        hasher.update(b"\n")
+    return hasher.hexdigest()
+
+
+def _get_retrieval_cache_paths(args):
+    if args.retrieval_cache_dir:
+        cache_dir = Path(args.retrieval_cache_dir)
+    else:
+        cache_dir = Path(LOCAL_EMBEDDINGS_DIR) / args.embedding_name / "_runtime_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    cache_tag = f"{args.retrieval_model_type}_{args.split}"
+    return {
+        "dir": cache_dir,
+        "meta": cache_dir / f"{cache_tag}_meta.json",
+        "all_token_embeddings": cache_dir / f"{cache_tag}_all_token_embeddings.float32.npy",
+        "token2pageidx": cache_dir / f"{cache_tag}_token2pageidx.int32.npy",
+        "page_doc_ids": cache_dir / f"{cache_tag}_page_doc_ids.json",
+        "page_indices": cache_dir / f"{cache_tag}_page_indices.int32.npy",
+    }
+
+
+def _load_retrieval_cache(cache_paths, expected_meta: dict):
+    required_paths = [
+        cache_paths["meta"],
+        cache_paths["all_token_embeddings"],
+        cache_paths["token2pageidx"],
+        cache_paths["page_doc_ids"],
+        cache_paths["page_indices"],
+    ]
+    if not all(path.exists() for path in required_paths):
+        return None
+
+    try:
+        with open(cache_paths["meta"], "r") as f:
+            cache_meta = json.load(f)
+    except Exception:
+        return None
+
+    for key, value in expected_meta.items():
+        if cache_meta.get(key) != value:
+            return None
+
+    try:
+        all_token_embeddings = np.load(cache_paths["all_token_embeddings"], mmap_mode="r")
+        token2pageidx = np.load(cache_paths["token2pageidx"], mmap_mode="r")
+        with open(cache_paths["page_doc_ids"], "r") as f:
+            page_doc_ids = json.load(f)
+        page_indices = np.load(cache_paths["page_indices"], mmap_mode="r")
+    except Exception:
+        return None
+
+    n_pages = len(page_doc_ids)
+    if n_pages == 0:
+        return None
+    if page_indices.shape[0] != n_pages:
+        return None
+    if token2pageidx.shape[0] != all_token_embeddings.shape[0]:
+        return None
+
+    token2pageuid = (token2pageidx, page_doc_ids, page_indices)
+    return all_token_embeddings, token2pageuid
+
+
+def _save_retrieval_cache(
+    cache_paths,
+    cache_meta: dict,
+    all_token_embeddings,
+    token2pageidx,
+    page_doc_ids,
+    page_indices,
+):
+    np.save(cache_paths["all_token_embeddings"], all_token_embeddings)
+    np.save(cache_paths["token2pageidx"], token2pageidx)
+    with open(cache_paths["page_doc_ids"], "w") as f:
+        json.dump(page_doc_ids, f)
+    np.save(cache_paths["page_indices"], page_indices)
+    with open(cache_paths["meta"], "w") as f:
+        json.dump(cache_meta, f, indent=2)
 
 
 def run_model(
@@ -144,33 +231,98 @@ def evaluate(data_loader, rag_model, index=None, data_len=None, args=None, **kwa
 
     logger.info("Preparing doc indices")
 
+    docid2embs = {}
+    all_token_embeddings = None
+    token2pageuid = None
+    docid2lens = None
+
     if args.retrieval_model_type == "colpali":
+        can_use_cache = bool(index is not None and args.retrieval_use_cache)
+        cache_paths = None
+        expected_cache_meta = None
+        if can_use_cache:
+            cache_paths = _get_retrieval_cache_paths(args)
+            expected_cache_meta = {
+                "embedding_name": args.embedding_name,
+                "split": args.split,
+                "retrieval_model_type": args.retrieval_model_type,
+                "doc_ids_signature": _get_doc_ids_signature(data_loader.dataset.all_supporting_doc_ids),
+                "num_docs": len(data_loader.dataset.all_supporting_doc_ids),
+            }
+            logger.info(f"Retrieval cache dir: {cache_paths['dir']}")
+
+        if can_use_cache and not args.retrieval_rebuild_cache:
+            cached_artifacts = _load_retrieval_cache(cache_paths, expected_cache_meta)
+            if cached_artifacts is not None:
+                all_token_embeddings, token2pageuid = cached_artifacts
+                logger.info(
+                    f"Loaded retrieval cache with {all_token_embeddings.shape[0]} token embeddings"
+                )
+
+        if all_token_embeddings is None or token2pageuid is None:
+            docid2embs = data_loader.dataset.load_all_embeddings()
+
+            #  reduce_embeddings(docid2embs=docid2embs)
+            # docid2embs_page_reudced = reduce_embeddings(docid2embs, dim='page')
+            # docid2embs_token_reudced = reduce_embeddings(docid2embs, dim='token')
+            # docid2embs_page_token_reudced = reduce_embeddings(docid2embs, dim='page_token')
+
+            if index is None:
+                logger.info("Index not loaded; skipping flattened token artifact prep")
+                all_token_embeddings = None
+                token2pageuid = None
+            else:
+                all_token_embeddings_chunks = []
+                token2pageidx_chunks = []
+                page_doc_ids = []
+                page_indices = []
+                page_global_idx = 0
+
+                for doc_id, doc_emb in tqdm(docid2embs.items(), total=len(docid2embs)):
+                    # e.g., doc_emb - torch.Size([9, 1030, 128])
+                    for page_id in range(len(doc_emb)):
+                        page_emb = doc_emb[page_id].view(-1, 128)
+                        all_token_embeddings_chunks.append(page_emb)
+                        token2pageidx_chunks.append(
+                            np.full(page_emb.shape[0], page_global_idx, dtype=np.int32)
+                        )
+                        page_doc_ids.append(doc_id)
+                        page_indices.append(page_id)
+                        page_global_idx += 1
+
+                logger.info(len(all_token_embeddings_chunks))
+
+                all_token_embeddings = torch.cat(all_token_embeddings_chunks, dim=0)
+                all_token_embeddings = all_token_embeddings.float().numpy()
+                token2pageidx = np.concatenate(token2pageidx_chunks, axis=0)
+                page_indices = np.asarray(page_indices, dtype=np.int32)
+                token2pageuid = (token2pageidx, page_doc_ids, page_indices)
+
+                logger.info("Created flattened token embeddings / token2page mapping")
+
+                if can_use_cache:
+                    cache_meta = dict(expected_cache_meta)
+                    cache_meta.update(
+                        {
+                            "num_pages": len(page_doc_ids),
+                            "num_tokens": int(all_token_embeddings.shape[0]),
+                            "emb_dim": int(all_token_embeddings.shape[1]),
+                        }
+                    )
+                    _save_retrieval_cache(
+                        cache_paths=cache_paths,
+                        cache_meta=cache_meta,
+                        all_token_embeddings=all_token_embeddings,
+                        token2pageidx=token2pageidx,
+                        page_doc_ids=page_doc_ids,
+                        page_indices=page_indices,
+                    )
+                    logger.info("Saved retrieval cache artifacts")
+
+                # Indexed retrieval path does not need full docid2embs after flattening.
+                docid2embs = {}
+    else:
         docid2embs = data_loader.dataset.load_all_embeddings()
-
-    #  reduce_embeddings(docid2embs=docid2embs)
-    # docid2embs_page_reudced = reduce_embeddings(docid2embs, dim='page')
-    # docid2embs_token_reudced = reduce_embeddings(docid2embs, dim='token')
-    # docid2embs_page_token_reudced = reduce_embeddings(docid2embs, dim='page_token')
-
-    all_token_embeddings = []
-    token2pageuid = []
-
-    if args.retrieval_model_type == "colpali":
-        for doc_id, doc_emb in tqdm(docid2embs.items(), total=len(docid2embs)):
-            # e.g., doc_emb - torch.Size([9, 1030, 128])
-            for page_id in range(len(doc_emb)):
-                page_emb = doc_emb[page_id].view(-1, 128)
-                all_token_embeddings.append(page_emb)
-
-                page_uid = f"{doc_id}_page{page_id}"
-                token2pageuid.extend([page_uid] * page_emb.shape[0])
-
-    logger.info(len(all_token_embeddings))
-
-    all_token_embeddings = torch.cat(all_token_embeddings, dim=0)
-    all_token_embeddings = all_token_embeddings.float().numpy()
-
-    logger.info("Created flattened token embeddings / token2pageuid")
 
     qid2result = {}
 

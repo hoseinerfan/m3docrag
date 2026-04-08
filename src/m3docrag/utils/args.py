@@ -54,6 +54,18 @@ class TrainingArguments(transformers.TrainingArguments):
         default=1,
         metadata={"help": "FAISS IVF nprobe at search time (ignored for non-IVF indexes)"},
     )
+    retrieval_use_cache: bool = field(
+        default=True,
+        metadata={"help": "Cache and reuse flattened retrieval artifacts for faster repeated runs"},
+    )
+    retrieval_rebuild_cache: bool = field(
+        default=False,
+        metadata={"help": "Force rebuilding retrieval cache files even if they already exist"},
+    )
+    retrieval_cache_dir: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional directory for retrieval cache files (defaults to <embeddings>/<embedding_name>/_runtime_cache)"},
+    )
 
 
     # Local paths

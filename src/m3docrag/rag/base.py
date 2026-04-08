@@ -82,6 +82,14 @@ class RAGModelBase:
 
 
         if index is not None:
+            use_compact_page_lookup = (
+                isinstance(token2pageuid, tuple)
+                and len(token2pageuid) == 3
+            )
+            if use_compact_page_lookup:
+                token2pageidx, page_doc_ids, page_indices = token2pageuid
+            else:
+                token2pageidx, page_doc_ids, page_indices = None, None, None
 
             # [n_query_tokens, dim]
             query_emb = self.retrieval_model.encode_queries([query])[0]
@@ -103,7 +111,10 @@ class RAGModelBase:
                 for nn_idx in range(k):
                     found_nearest_doc_token_idx = I[q_idx, nn_idx]
 
-                    page_uid = token2pageuid[found_nearest_doc_token_idx]  # Get the document ID for this token
+                    if use_compact_page_lookup:
+                        page_uid = int(token2pageidx[found_nearest_doc_token_idx])
+                    else:
+                        page_uid = token2pageuid[found_nearest_doc_token_idx]  # Get the document ID for this token
 
                     # reconstruct the original score
                     doc_token_emb = all_token_embeddings[found_nearest_doc_token_idx]
@@ -136,8 +147,13 @@ class RAGModelBase:
                 # logger.info(f"{page_uid} with score {score}")
 
                 # page_uid = f"{doc_id}_page{page_id}"
-                doc_id = page_uid.split('_page')[0]
-                page_idx = int(page_uid.split('_page')[-1])
+                if use_compact_page_lookup:
+                    page_lookup_idx = int(page_uid)
+                    doc_id = page_doc_ids[page_lookup_idx]
+                    page_idx = int(page_indices[page_lookup_idx])
+                else:
+                    doc_id = page_uid.split('_page')[0]
+                    page_idx = int(page_uid.split('_page')[-1])
                 sorted_results.append((doc_id, page_idx, score.item()))
 
             return sorted_results
