@@ -326,13 +326,32 @@ def main():
             use_flash_attn = False
             attn_implementation = "eager"
 
-        vqa_model = VQAModel(
-            model_name_or_path=local_model_dir,
-            model_type=model_type,
-            bits=args.bits,
-            use_flash_attn=use_flash_attn,
-            attn_implementation=attn_implementation,
-        )
+        try:
+            vqa_model = VQAModel(
+                model_name_or_path=local_model_dir,
+                model_type=model_type,
+                bits=args.bits,
+                use_flash_attn=use_flash_attn,
+                attn_implementation=attn_implementation,
+            )
+        except ImportError as e:
+            # Some environments have compatible GPUs but no flash_attn package.
+            # Fall back to eager attention automatically for usability.
+            if use_flash_attn and "flash_attn" in str(e).lower():
+                logger.warning(
+                    "FlashAttention requested but unavailable; retrying with eager attention."
+                )
+                use_flash_attn = False
+                attn_implementation = "eager"
+                vqa_model = VQAModel(
+                    model_name_or_path=local_model_dir,
+                    model_type=model_type,
+                    bits=args.bits,
+                    use_flash_attn=use_flash_attn,
+                    attn_implementation=attn_implementation,
+                )
+            else:
+                raise
 
         logger.info(f"loaded VQA model - {model_type}: {local_model_dir}")
 
