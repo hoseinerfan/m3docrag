@@ -374,6 +374,12 @@ def main():
         import faiss
 
         index = faiss.read_index(str(local_index_dir / "index.bin"))
+        try:
+            ivf_index = faiss.extract_index_ivf(index)
+            ivf_index.nprobe = int(args.faiss_nprobe)
+            logger.info(f"Configured FAISS IVF nprobe={ivf_index.nprobe}")
+        except Exception:
+            logger.info("FAISS index is non-IVF; faiss_nprobe ignored")
         logger.info("Loading faiss index -- done")
 
     def list_collate_fn(batch):

@@ -50,6 +50,10 @@ class TrainingArguments(transformers.TrainingArguments):
         default=None,
         metadata={"help": "Absolute path to FAISS index directory containing index.bin; overrides embedding_name+faiss_index_type"},
     )
+    faiss_nprobe: int = field(
+        default=1,
+        metadata={"help": "FAISS IVF nprobe at search time (ignored for non-IVF indexes)"},
+    )
 
 
     # Local paths
