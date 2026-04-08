@@ -103,15 +103,61 @@ def parse_args(args=None):
         except RuntimeError as exc:
             m = re.search(r"name '([^']+)' is not defined", str(exc))
             if not m:
-                raise
+                parser = None
+                break
             missing = m.group(1)
             if missing in globals():
-                raise
+                parser = None
+                break
             globals()[missing] = str
-    if parser is None:
-        raise RuntimeError("Failed to initialize HfArgumentParser for TrainingArguments.")
 
-    parsed_args, remaining_args = parser.parse_args_into_dataclasses(args, return_remaining_strings=True)
+    if parser is not None:
+        parsed_args, remaining_args = parser.parse_args_into_dataclasses(args, return_remaining_strings=True)
+        ic(remaining_args)
+        return parsed_args
+
+    # Fallback parser for environments where transformers HfArgumentParser cannot
+    # resolve TrainingArguments annotations.
+    import argparse
+
+    def _str2bool(v):
+        if isinstance(v, bool):
+            return v
+        s = str(v).strip().lower()
+        if s in {"1", "true", "t", "yes", "y"}:
+            return True
+        if s in {"0", "false", "f", "no", "n"}:
+            return False
+        raise argparse.ArgumentTypeError(f"Invalid boolean value: {v}")
+
+    p = argparse.ArgumentParser()
+    # Common output/runtime args used across example scripts.
+    p.add_argument("--output_dir", type=str, required=True)
+    p.add_argument("--per_device_eval_batch_size", type=int, default=8)
+    p.add_argument("--dataloader_num_workers", type=int, default=0)
+
+    # Dataclass fields used by m3docrag examples.
+    p.add_argument("--split", type=str, default="train")
+    p.add_argument("--data_name", type=str, default="m3-docvqa")
+    p.add_argument("--data_len", type=int, default=None)
+    p.add_argument("--use_dummy_images", type=_str2bool, default=False)
+    p.add_argument("--load_embedding", type=_str2bool, default=False)
+    p.add_argument("--embedding_name", type=str, default="colpali-v1.2_m3-docvqa_dev")
+    p.add_argument("--max_pages", type=int, default=20)
+    p.add_argument("--do_page_padding", type=_str2bool, default=False)
+    p.add_argument("--retrieval_model_type", type=str, default="colpali", choices=["colpali", "colbert"])
+    p.add_argument("--use_retrieval", type=_str2bool, default=True)
+    p.add_argument("--retrieval_only", type=_str2bool, default=False)
+    p.add_argument("--page_retrieval_type", type=str, default="logits")
+    p.add_argument("--loop_unique_doc_ids", type=_str2bool, default=False)
+    p.add_argument("--n_retrieval_pages", type=int, default=1)
+    p.add_argument("--faiss_index_type", type=str, default="ivfflat", choices=["flatip", "ivfflat", "ivfpq"])
+    p.add_argument("--model_name_or_path", type=str, default="Qwen2-VL-7B-Instruct")
+    p.add_argument("--retrieval_model_name_or_path", type=str, default="colpaligemma-3b-pt-448-base")
+    p.add_argument("--retrieval_adapter_model_name_or_path", type=str, default="colpali-v1.2")
+    p.add_argument("--bits", type=int, default=16)
+    p.add_argument("--do_image_splitting", type=_str2bool, default=False)
+
+    parsed_args, remaining_args = p.parse_known_args(args=args)
     ic(remaining_args)
-
     return parsed_args
