@@ -14,15 +14,25 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 
+import time
+from pathlib import Path
+
 import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 # from transformers import AutoProcessor
 from PIL import Image
 from typing import List
+from loguru import logger
 
 from colpali_engine.models import ColPali, ColPaliProcessor
 from colpali_engine.models import ColQwen2, ColQwen2Processor
+
+
+def _is_local_path(path_like) -> bool:
+    path = Path(str(path_like)).expanduser()
+    return path.is_absolute() or path.exists()
+
 
 def init(
     backbone_name_or_path="/job/model/colpaligemma-3b-pt-448-base",
@@ -48,15 +58,43 @@ def init(
         processor_class = ColQwen2Processor
         kwargs['attn_implementation'] = "flash_attention_2"
 
+    model_load_kwargs = {}
+    if _is_local_path(backbone_name_or_path):
+        model_load_kwargs["local_files_only"] = True
+
+    processor_load_kwargs = {}
+    if _is_local_path(adapter_name_or_path):
+        processor_load_kwargs["local_files_only"] = True
+
+    logger.info(
+        f"[colpali:init] Loading backbone with {model_class.__name__} from "
+        f"{backbone_name_or_path} (local_files_only={model_load_kwargs.get('local_files_only', False)})"
+    )
+    t0 = time.perf_counter()
     model = model_class.from_pretrained(
         backbone_name_or_path,
         torch_dtype=dtype,
         low_cpu_mem_usage=True,
+        **model_load_kwargs,
         **kwargs
     ).eval()
+    logger.info(f"[colpali:init] Backbone loaded in {time.perf_counter() - t0:.2f}s")
 
+    logger.info(f"[colpali:init] Loading adapter from {adapter_name_or_path}")
+    t0 = time.perf_counter()
     model.load_adapter(adapter_name_or_path)
-    processor = processor_class.from_pretrained(adapter_name_or_path)
+    logger.info(f"[colpali:init] Adapter loaded in {time.perf_counter() - t0:.2f}s")
+
+    logger.info(
+        f"[colpali:init] Loading processor with {processor_class.__name__} from "
+        f"{adapter_name_or_path} (local_files_only={processor_load_kwargs.get('local_files_only', False)})"
+    )
+    t0 = time.perf_counter()
+    processor = processor_class.from_pretrained(
+        adapter_name_or_path,
+        **processor_load_kwargs,
+    )
+    logger.info(f"[colpali:init] Processor loaded in {time.perf_counter() - t0:.2f}s")
 
     return model, processor
 
