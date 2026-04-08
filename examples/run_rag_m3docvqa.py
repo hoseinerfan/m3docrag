@@ -85,6 +85,9 @@ def run_model(
         token2pageuid=token2pageuid,
         all_token_embeddings=all_token_embeddings,
         n_return_pages=n_return_pages,
+        single_page_from_each_doc=args.single_page_from_each_doc,
+        faiss_token_topk=args.faiss_token_topk,
+        faiss_exact_rerank_pages=args.faiss_exact_rerank_pages,
         show_progress=True,
     )
     logger.info(top_n_page_retrieval_results)

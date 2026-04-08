@@ -60,6 +60,8 @@ class RAGModelBase:
 
         n_return_pages: int = 1,
         single_page_from_each_doc: bool = False,
+        faiss_token_topk: int = 0,
+        faiss_exact_rerank_pages: int = 0,
         show_progress=False,
     ) -> List[Tuple]:
         """
@@ -74,6 +76,8 @@ class RAGModelBase:
             - index: faiss index
             - n_return_pages (int): number of pages to return
             - single_page_from_each_doc (bool): if true, only single page is retrieved from each PDF document.
+            - faiss_token_topk (int): number of token hits to retrieve per query token before page aggregation (0 -> n_return_pages)
+            - faiss_exact_rerank_pages (int): if >0, exact rerank of top candidate pages after ANN aggregation
 
         Return:
             retrieval_results
@@ -84,12 +88,17 @@ class RAGModelBase:
         if index is not None:
 
             # [n_query_tokens, dim]
-            query_emb = self.retrieval_model.encode_queries([query])[0]
-            query_emb = query_emb.cpu().float().numpy().astype(np.float32)
+            query_emb_torch = self.retrieval_model.encode_queries([query])[0]
+            query_emb = query_emb_torch.cpu().float().numpy().astype(np.float32)
 
             # NN search
-            k = n_return_pages
-            D, I = index.search(query_emb, k)
+            k_pages = max(1, int(n_return_pages))
+            k_token = int(faiss_token_topk) if int(faiss_token_topk) > 0 else k_pages
+            index_ntotal = getattr(index, "ntotal", None)
+            if isinstance(index_ntotal, int) and index_ntotal > 0:
+                k_token = min(k_token, index_ntotal)
+            k_token = max(1, k_token)
+            D, I = index.search(query_emb, k_token)
 
             # Sum the MaxSim scores across all query tokens for each document
             final_page2scores = {}
@@ -100,7 +109,7 @@ class RAGModelBase:
                 # Initialize a dictionary to hold document relevance scores
                 curent_q_page2scores = {}
 
-                for nn_idx in range(k):
+                for nn_idx in range(k_token):
                     found_nearest_doc_token_idx = I[q_idx, nn_idx]
 
                     page_uid = token2pageuid[found_nearest_doc_token_idx]  # Get the document ID for this token
@@ -125,20 +134,74 @@ class RAGModelBase:
             # Sort documents by their final relevance score
             sorted_pages = sorted(final_page2scores.items(), key=lambda x: x[1], reverse=True)
 
-            # Get the top-k document candidates
-            top_k_pages = sorted_pages[:k]
+            if int(faiss_exact_rerank_pages) > 0 and len(sorted_pages) > 0:
+                rerank_pool_size = max(k_pages, int(faiss_exact_rerank_pages))
+                approx_candidates = sorted_pages[:rerank_pool_size]
+
+                page_embeds = []
+                page_meta = []
+                for page_uid, _approx_score in approx_candidates:
+                    if "_page" not in page_uid:
+                        continue
+                    doc_id, page_idx_str = page_uid.rsplit("_page", 1)
+                    if doc_id not in docid2embs:
+                        continue
+                    page_idx = int(page_idx_str)
+                    if page_idx < 0 or page_idx >= len(docid2embs[doc_id]):
+                        continue
+                    page_embeds.append(docid2embs[doc_id][page_idx])
+                    page_meta.append((doc_id, page_idx))
+
+                if page_embeds:
+                    exact_scores = self.retrieval_model.retrieve(
+                        query=query,
+                        doc_embeds=page_embeds,
+                        return_top_1=False,
+                    )
+                    if isinstance(exact_scores, torch.Tensor):
+                        exact_scores = exact_scores.detach().cpu().flatten().tolist()
+                    else:
+                        exact_scores = np.asarray(exact_scores).reshape(-1).tolist()
+
+                    reranked_pages = []
+                    for idx, score in enumerate(exact_scores):
+                        doc_id, page_idx = page_meta[idx]
+                        reranked_pages.append((doc_id, page_idx, float(score)))
+
+                    reranked_pages.sort(key=lambda x: x[2], reverse=True)
+
+                    if single_page_from_each_doc:
+                        deduped_pages = []
+                        seen_doc_ids = set()
+                        for doc_id, page_idx, score in reranked_pages:
+                            if doc_id in seen_doc_ids:
+                                continue
+                            seen_doc_ids.add(doc_id)
+                            deduped_pages.append((doc_id, page_idx, score))
+                            if len(deduped_pages) >= k_pages:
+                                break
+                        return deduped_pages
+
+                    return reranked_pages[:k_pages]
 
             
             # [(doc_id, page_idx, scores)...]
-
             sorted_results = []
-            for page_uid, score in top_k_pages:
-                # logger.info(f"{page_uid} with score {score}")
+            seen_doc_ids = set()
+            for page_uid, score in sorted_pages:
+                if "_page" not in page_uid:
+                    continue
+                doc_id, page_idx_str = page_uid.rsplit("_page", 1)
+                page_idx = int(page_idx_str)
 
-                # page_uid = f"{doc_id}_page{page_id}"
-                doc_id = page_uid.split('_page')[0]
-                page_idx = int(page_uid.split('_page')[-1])
-                sorted_results.append((doc_id, page_idx, score.item()))
+                if single_page_from_each_doc:
+                    if doc_id in seen_doc_ids:
+                        continue
+                    seen_doc_ids.add(doc_id)
+
+                sorted_results.append((doc_id, page_idx, float(score)))
+                if len(sorted_results) >= k_pages:
+                    break
 
             return sorted_results
 
